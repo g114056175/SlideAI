@@ -24,11 +24,13 @@ def _clear_llm_env(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
-def test_custom_openai_compatible_provider_can_run_without_api_key(monkeypatch):
+def test_custom_openai_compatible_provider_can_run_without_api_key(monkeypatch, tmp_path):
     _clear_llm_env(monkeypatch)
     monkeypatch.setenv("LLM_PROVIDER", "custom")
     monkeypatch.setenv("CUSTOM_LLM_ENDPOINT", "http://127.0.0.1:8081/v1/chat/completions")
     monkeypatch.setenv("CUSTOM_LLM_MODEL", "local-alias")
+    image = tmp_path / "slide.jpg"
+    image.write_bytes(b"image-input")
     captured = {}
 
     class DummyResponse:
@@ -47,8 +49,8 @@ def test_custom_openai_compatible_provider_can_run_without_api_key(monkeypatch):
     assert llm_api.llm_is_configured() is True
     assert llm_api.get_configured_llm_provider() == "custom"
     result = asyncio.run(
-        llm_api.generate_presentation_scripts(
-            text_array=["測試頁面"],
+        llm_api.generate_presentation_scripts_from_images(
+            image_paths=[image],
             language="zh",
         )
     )
@@ -77,47 +79,13 @@ def test_explicit_provider_prefers_its_own_key_over_legacy_key(monkeypatch):
     assert llm_api.get_llm_api_key() == "selected-openai-key"
 
 
-def test_google_provider_uses_new_genai_client(monkeypatch):
-    _clear_llm_env(monkeypatch)
-    captured = {"closed": False}
-
-    class DummyModels:
-        def generate_content(self, *, model, contents):
-            captured.update(model=model, contents=contents)
-            return type("Response", (), {"text": "這是一段足夠完整的測試講稿內容。"})()
-
-    class DummyClient:
-        models = DummyModels()
-
-        def close(self):
-            captured["closed"] = True
-
-    def fake_client(*, api_key):
-        captured["api_key"] = api_key
-        return DummyClient()
-
-    monkeypatch.setattr(llm_api.genai, "Client", fake_client)
-
-    result = asyncio.run(llm_api.gemini_chat(
-        text_array=["測試投影片"],
-        script="unused",
-        api_key="AQ.test-key",
-        language="zh",
-        model_name_override="gemini-test",
-    ))
-
-    assert result == ["這是一段足夠完整的測試講稿內容。"]
-    assert captured["api_key"] == "AQ.test-key"
-    assert captured["model"] == "gemini-test"
-    assert "測試投影片" in captured["contents"]
-    assert captured["closed"] is True
-
-
-def test_global_llm_limit_is_shared_by_five_users(monkeypatch):
+def test_global_llm_limit_is_shared_by_five_users(monkeypatch, tmp_path):
     _clear_llm_env(monkeypatch)
     monkeypatch.setenv("LLM_PROVIDER", "custom")
     monkeypatch.setenv("CUSTOM_LLM_ENDPOINT", "http://127.0.0.1:8081/v1/chat/completions")
     monkeypatch.setenv("CUSTOM_LLM_MODEL", "local-alias")
+    image = tmp_path / "slide.jpg"
+    image.write_bytes(b"image-input")
     state = {"active": 0, "peak": 0}
     guard = threading.Lock()
 
@@ -141,8 +109,8 @@ def test_global_llm_limit_is_shared_by_five_users(monkeypatch):
 
     async def five_users():
         return await asyncio.gather(*(
-            llm_api.generate_presentation_scripts(
-                text_array=[f"使用者 {index} 第一頁", f"使用者 {index} 第二頁"],
+            llm_api.generate_presentation_scripts_from_images(
+                image_paths=[image, image],
                 language="zh",
             )
             for index in range(5)

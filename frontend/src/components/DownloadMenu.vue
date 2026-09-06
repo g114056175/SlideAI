@@ -1,33 +1,35 @@
 <template>
-  <div class="download-menu">
+  <div ref="root" class="download-menu">
     <button
       type="button"
       class="btn download-menu-trigger"
       :disabled="!videoUrl"
       :aria-expanded="open"
-      @click="open = !open"
+      @click="toggle"
     >{{ label }} <span class="download-caret">▾</span></button>
     <div v-if="open" class="download-options" role="menu">
-      <a :href="videoUrl" download role="menuitem" @click="open = false">下載影片</a>
-      <a v-if="srtUrl" :href="srtUrl" download role="menuitem" @click="open = false">下載 SRT</a>
+      <a :href="videoUrl" download role="menuitem" @click="close">下載影片</a>
+      <a v-if="srtUrl" :href="srtUrl" download role="menuitem" @click="close">下載 SRT</a>
       <span v-else class="disabled-option">下載 SRT</span>
-      <a v-if="bundleUrl" :href="bundleUrl" download role="menuitem" @click="open = false">下載全部</a>
+      <a v-if="bundleUrl" :href="bundleUrl" download role="menuitem" @click="close">下載全部</a>
       <span v-else class="disabled-option">下載全部</span>
     </div>
   </div>
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { watch } from 'vue'
+import { useExclusiveMenu } from '../composables/useExclusiveMenu.js'
 
-defineProps({
+const props = defineProps({
   label: { type: String, default: '下載' },
   videoUrl: { type: String, default: '' },
   srtUrl: { type: String, default: '' },
   bundleUrl: { type: String, default: '' },
 })
 
-const open = ref(false)
+const { root, open, toggle, close } = useExclusiveMenu()
+watch(() => props.videoUrl, close)
 </script>
 
 <style scoped>
@@ -77,11 +79,12 @@ const open = ref(false)
   color: #e2e8f0;
   text-decoration: none;
   font-size: 13px;
+  font-weight: 500;
   text-align: left;
 }
 
 .download-options a:hover {
-  color: #ffffff;
+  color: #e2e8f0;
   background: #172033;
 }
 

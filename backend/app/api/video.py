@@ -1,25 +1,19 @@
+from backend.app.services.upload_limits import read_upload_limited
 import os
 import asyncio
-import subprocess
 import tempfile
 import shutil
-import base64
-import zipfile
 import json
-import ast
 import uuid
 import logging
 import threading
 import time
 import re
 from pathlib import Path
-from fastapi import APIRouter, UploadFile, File, Form, Request, Query, HTTPException, Response
+from fastapi import APIRouter, UploadFile, File, Form, Request, HTTPException, Response
 from fastapi.responses import FileResponse, JSONResponse
 import io
-from pdf2image import convert_from_path
 from pydantic import BaseModel, Field
-from PIL import Image, UnidentifiedImageError
-import urllib.parse
 from typing import Optional, List
 import pypdf as PyPDF2
 from backend.app.services.speech_providers import (
@@ -31,15 +25,12 @@ from backend.app.services.speech_providers import (
     warm_tts_provider,
 )
 from backend.app.services.artifact_store import get_video_run_store
-from backend.app.services.video_merge import merge_video_files
+from backend.app.services.ass_renderer import generate_ass_script
 from backend.app.api.video_helpers import (
     apply_audio_speed as _apply_audio_speed,
     clamp_preview_speed as _clamp_preview_speed,
     is_local_only_mode as _is_local_only_mode,
     is_mock_mode as _is_mock_mode,
-    is_truthy_env as _is_truthy_env,
-    make_alignment_id as _make_alignment_id,
-    pregenerate_thumbnails_safe as _pregenerate_thumbnails,
     split_user_script_to_pages as _split_user_script_to_pages,
     to_traditional_chinese_for_display as _to_traditional_chinese_for_display,
 )
@@ -47,9 +38,6 @@ logger = logging.getLogger("video_abstract")
 logging.basicConfig(level=logging.INFO)
 
 router = APIRouter()
-_ALIGNMENT_CACHE: dict[str, dict] = {}
-_ALIGNMENT_CACHE_TTL_SEC = 900 # 15 minutes
-MAX_CACHE_ENTRIES = 3
 _PRESET_VOICE_DIR = Path(__file__).resolve().parents[1] / "static" / "ref_voices"
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", str(50 * 1024 * 1024)))
 
@@ -73,18 +61,6 @@ def _load_preset_reference_voice(voice_key: str) -> tuple[bytes, str, str] | Non
         return None
 
 
-def _purge_alignment_cache() -> None:
-    now = time.time()
-    expired = [k for k, v in _ALIGNMENT_CACHE.items() if now - float(v.get("ts", 0)) > _ALIGNMENT_CACHE_TTL_SEC]
-    for k in expired:
-        _ALIGNMENT_CACHE.pop(k, None)
-
-    if len(_ALIGNMENT_CACHE) > MAX_CACHE_ENTRIES:
-        sorted_keys = sorted(_ALIGNMENT_CACHE.keys(), key=lambda k: float(_ALIGNMENT_CACHE[k].get("ts", 0)))
-        for k in sorted_keys[:-MAX_CACHE_ENTRIES]:
-            _ALIGNMENT_CACHE.pop(k, None)
-
-
 def _pregenerate_run_thumbnails_safe(run_id: str, pdf_path: str) -> None:
     """Best-effort page image cache for the persistent run store.
 
@@ -92,46 +68,11 @@ def _pregenerate_run_thumbnails_safe(run_id: str, pdf_path: str) -> None:
     immediately while previews become available progressively.
     """
     try:
-        store = get_video_run_store()
-        images = convert_from_path(
-            pdf_path,
-            thread_count=2,
-            poppler_path=os.getenv("POPPLER_PATH", None),
-        )
-        for page_idx, img in enumerate(images):
-            img = img.convert("RGB")
-            max_w = 1280
-            if img.width > max_w:
-                ratio = max_w / max(img.width, 1)
-                img = img.resize((max_w, max(1, int(img.height * ratio))), Image.Resampling.LANCZOS)
-            thumbnail = io.BytesIO()
-            img.save(thumbnail, format="JPEG", quality=82, optimize=True)
-            try:
-                # The store owns the per-run thread/process lock and verifies
-                # that the manifest still exists.  Writing through it prevents
-                # this daemon from recreating a run after the user deletes it.
-                store.record_page_asset(
-                    run_id=run_id,
-                    page_index=page_idx,
-                    slide_bytes=thumbnail.getvalue(),
-                    suffix=".jpg",
-                )
-            except FileNotFoundError:
-                logger.info(f"[UPLOAD][BG] Thumbnail cache cancelled for deleted run={run_id}")
-                return
-        logger.info(f"[UPLOAD][BG] Cached {len(images)} run thumbnails for run={run_id}")
-    except Exception as thumb_err:
-        logger.warning(f"[UPLOAD][BG] Run thumbnail cache failed run={run_id}: {thumb_err}")
+        from backend.app.services.page_images import ensure_run_images
+        ensure_run_images(get_video_run_store(), run_id)
+    except Exception as exc:
+        logger.warning("[UPLOAD][BG] Page images failed run=%s: %s", run_id, exc)
 
-
-class TextsRequest(BaseModel):
-    texts: list[str]
-    pdf_id: str
-    resolution: int = 1080
-    tts_model: str = 'voxcpm'
-    voice: str = 'zh-TW-YunJheNeural'
-    enable_subtitles: bool = True
-    # 可擴充更多影片選項
 
 
 def _use_nano_voxcpm_tts() -> bool:
@@ -141,15 +82,10 @@ def _use_nano_voxcpm_tts() -> bool:
 @router.post("/api/video-abstract")
 async def video_abstract_api(
     request: Request,
-    file: UploadFile = File(None),
+    file: UploadFile = File(...),
 ):
-    """
-    1. 若有 file，回傳 AI 文字陣列（JSON，不產生影片）
-    2. 若為 application/json 且有 texts，產生影片並回傳影片檔案
-    """
-
+    """Create a persistent project; script generation has its own endpoint."""
     mock_mode = _is_mock_mode()
-    local_only_mode = _is_local_only_mode()
 
     if file:
         # The local-first application accepts PDF presentations only.
@@ -190,7 +126,6 @@ async def video_abstract_api(
 
         # 僅在系統啟動時檢查 Poppler，這裡不下載/檢查。
         # 只產生 AI 文字，不產生影片
-        local_only_mode = _is_local_only_mode()
         try:
             form = await request.form()
             content_language = form.get('content_language') if 'content_language' in form else None
@@ -209,9 +144,14 @@ async def video_abstract_api(
             user_script = ""
 
         try:
-            with open(pdf_path, "rb") as pdf_file:
-                reader = PyPDF2.PdfReader(pdf_file)
-                page_count = len(reader.pages)
+            try:
+                with open(pdf_path, "rb") as pdf_file:
+                    reader = PyPDF2.PdfReader(pdf_file)
+                    page_count = len(reader.pages)
+                if page_count == 0:
+                    raise ValueError("PDF 沒有頁面")
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail="PDF 無法解析或沒有頁面") from exc
 
             if subtitle_source == "none":
                 ai_texts = ["" for _ in range(page_count)]
@@ -219,37 +159,8 @@ async def video_abstract_api(
             elif subtitle_source == "user_input":
                 ai_texts = _split_user_script_to_pages(user_script, page_count)
                 logger.info(f"[UPLOAD] subtitle_source=user_input, parsed {len(ai_texts)} page scripts")
-            elif mock_mode or local_only_mode or skip_llm:
-                # Fast path for lab/demo: when skipping LLM, only count pages.
-                ai_texts = ["" for _ in range(page_count)]
-                logger.info(
-                    f"[UPLOAD] Skip LLM (mock={mock_mode}, local_only={local_only_mode}, "
-                    f"skip_llm={skip_llm}, subtitle_source={subtitle_source!r}), return empty scripts for {len(ai_texts)} pages"
-                )
             else:
-                from backend.app.services.utility.pdf import pdf_to_text_array
-                text_array = pdf_to_text_array(pdf_path)
-                from backend.app.services.utility.api import (
-                    generate_presentation_scripts,
-                    get_llm_api_key,
-                    llm_is_configured,
-                )
-                script = "請根據每一頁內容生成簡報稿，語氣簡潔明確。"
-                from dotenv import load_dotenv
-                dotenv_path = os.path.join(os.path.dirname(__file__), '..', '.env')
-                load_dotenv(dotenv_path=dotenv_path)
-                api_key = get_llm_api_key()
-                if not llm_is_configured():
-                    raise RuntimeError(".env 尚未完成 LLM provider、model 或 endpoint 設定")
-                # 優先使用 content_language，其次 language，再用 voice 提示
-                detected_language = content_language or language_hint or voice_hint
-                logger.info(f"[UPLOAD] Detected language for AI generation: {detected_language}")
-                ai_texts = await generate_presentation_scripts(
-                    text_array=text_array,
-                    script=script,
-                    api_key=api_key,
-                    language=detected_language,
-                )
+                ai_texts = ["" for _ in range(page_count)]
         except Exception:
             shutil.rmtree(run_store.run_dir(reserved_run_id), ignore_errors=True)
             raise
@@ -280,15 +191,6 @@ async def video_abstract_api(
             )
             run_id = str(run_manifest.get("run_id") or "")
             logger.info(f"[UPLOAD] Created video run id={run_id} name={project_name}")
-            if not _is_truthy_env("VIDEO_ABSTRACT_DISABLE_PERSISTENT_THUMBNAILS", "true"):
-                thumb_base = os.path.join(os.path.dirname(__file__), "..", "user_thumbnails")
-                thumb_base = os.path.abspath(thumb_base)
-                thumb_dir = os.path.join(thumb_base, pdf_id)
-                threading.Thread(
-                    target=_pregenerate_thumbnails,
-                    args=(pdf_path, thumb_dir, logger),
-                    daemon=True,
-                ).start()
             threading.Thread(
                 target=_pregenerate_run_thumbnails_safe,
                 args=(run_id, pdf_path),
@@ -310,102 +212,6 @@ async def video_abstract_api(
             # model-dependent request after the PDF upload has succeeded.
             "model_services_skipped": bool(mock_mode),
         })
-
-    # 舊版 JSON 產片主流程已停用（EdgeTTS / 舊字幕估算 / 舊 MoviePy 管線）
-    if request.headers.get("content-type", "").startswith("application/json"):
-        raise HTTPException(
-            status_code=410,
-            detail="舊版 JSON 影片生成流程已停用。請使用 /video-abstract-lab 的 QwenTTS + Qwen 強對齊 + ASS 渲染流程。",
-        )
-    return JSONResponse({"detail": "請上傳 PDF 或傳送 texts"}, status_code=400)
-
-
-@router.get("/api/video-abstract/thumbnail")
-async def video_abstract_thumbnail(pdf_id: str = Query(...), page: int = Query(1, ge=1)):
-    """Return a PNG thumbnail for a given PDF page.
-
-    Resolution order:
-    1. user_thumbnails/<pdf_id>/page_N.png  (persistent, generated at upload)
-    2. data/video_runs/<run_id>/pages cached image
-    3. data/video_runs/<run_id>/input PDF rendered on demand
-
-    Query params:
-    - pdf_id: the UUID returned when the PDF was uploaded
-    - page: 1-based page index
-    """
-    # 1. Check persistent thumbnail store first (optional).
-    if not _is_truthy_env("VIDEO_ABSTRACT_DISABLE_PERSISTENT_THUMBNAILS", "true"):
-        thumb_base = os.path.join(os.path.dirname(__file__), "..", "user_thumbnails")
-        thumb_base = os.path.abspath(thumb_base)
-        persistent_png = os.path.join(thumb_base, pdf_id, f"page_{page}.png")
-        if os.path.exists(persistent_png):
-            try:
-                # Validate PNG integrity to avoid serving half-written/corrupted files.
-                with Image.open(persistent_png) as im:
-                    im.verify()
-                logger.info(f"[THUMBNAIL] Serving persistent thumbnail: {persistent_png}")
-                with open(persistent_png, "rb") as f:
-                    return Response(content=f.read(), media_type="image/png")
-            except (UnidentifiedImageError, OSError, SyntaxError) as img_err:
-                logger.warning(f"[THUMBNAIL] Persistent thumbnail invalid, fallback to render: {img_err}")
-
-    # Resolve the legacy pdf_id through the canonical video-run manifest.
-    store = get_video_run_store()
-    manifest = store.find_manifest_by_pdf_id(pdf_id)
-    if not manifest:
-        logger.warning(f"[THUMBNAIL] No video run found for pdf_id={pdf_id}")
-        raise HTTPException(status_code=404, detail="Thumbnail not found")
-
-    run_id = str(manifest.get("run_id") or "")
-    page_index = max(0, int(page) - 1)
-    page_items = manifest.get("pages") or []
-    page_item = page_items[page_index] if page_index < len(page_items) else {}
-    candidates = []
-    stored_slide = str(((page_item or {}).get("paths") or {}).get("slide") or "").strip()
-    if stored_slide:
-        candidates.append(stored_slide)
-    page_dir = store.page_dir(run_id, page_index)
-    candidates.extend([
-        str(page_dir / f"page_{page:03d}.jpg"),
-        str(page_dir / f"page_{page:03d}.png"),
-        str(store.run_dir(run_id) / "pages" / f"page_{page:03d}.jpg"),
-    ])
-    for candidate in candidates:
-        if candidate and os.path.isfile(candidate):
-            media_type = "image/png" if candidate.lower().endswith(".png") else "image/jpeg"
-            return FileResponse(candidate, media_type=media_type)
-
-    pdf_path = str((manifest.get("paths") or {}).get("pdf") or "").strip()
-    logger.info(f"[THUMBNAIL] Cached image not found; rendering run PDF: {pdf_path} page={page}")
-    if not pdf_path or not os.path.isfile(pdf_path):
-        logger.warning(f"[THUMBNAIL] Run PDF not found: {pdf_path}")
-        raise HTTPException(status_code=404, detail="Thumbnail not found")
-
-    try:
-        images = convert_from_path(
-            pdf_path,
-            first_page=page,
-            last_page=page,
-            thread_count=1,
-            poppler_path=os.getenv("POPPLER_PATH", None)
-        )
-        if not images:
-            raise HTTPException(status_code=500, detail="Failed to render PDF page")
-        img = images[0]
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        buf.seek(0)
-        return Response(content=buf.getvalue(), media_type="image/png")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"[THUMBNAIL] Error rendering thumbnail: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Error rendering thumbnail")
-
-
-# ── TTS 試聽 Preview Endpoint ──────────────────────────────────────────────
-from fastapi import Form
-import tempfile, asyncio
 
 @router.post("/api/video-abstract/tts-preview")
 async def tts_preview_endpoint(
@@ -429,7 +235,7 @@ async def tts_preview_endpoint(
     ref_data = None
     file_suffix = ".wav"
     if reference_audio is not None:
-        ref_data = await reference_audio.read()
+        ref_data = await read_upload_limited(reference_audio)
         file_suffix = os.path.splitext(reference_audio.filename or "")[-1] or ".wav"
 
     if ref_data:
@@ -454,9 +260,9 @@ async def tts_preview_endpoint(
                 logger.error(f"[TTS Preview] LOCAL_ONLY mode and {provider} unavailable: {reason}")
                 raise HTTPException(status_code=500, detail=f"LOCAL_ONLY 模式下 {provider} 失敗：{reason}")
             raise HTTPException(status_code=500, detail=f"{provider} 失敗：{reason}")
+        except HTTPException:
+            raise
         except Exception as e:
-            if isinstance(e, HTTPException):
-                raise
             if local_only_mode:
                 logger.error(f"[TTS Preview] LOCAL_ONLY mode and TTS exception: {e}")
                 raise HTTPException(status_code=500, detail=f"LOCAL_ONLY 模式下 TTS 例外：{str(e)}")
@@ -491,7 +297,7 @@ async def video_run_page_tts_endpoint(
     import os
     if page_index < 0:
         raise HTTPException(status_code=400, detail="page_index must be >= 0")
-    ref_data = await reference_audio.read() if reference_audio is not None else None
+    ref_data = await read_upload_limited(reference_audio) if reference_audio is not None else None
     reference_filename = reference_audio.filename if reference_audio is not None else "reference.wav"
     current_settings = {}
     if not ref_data:
@@ -718,7 +524,6 @@ async def video_run_page_align_endpoint(
     pause_threshold_ms: int = Form(320),
     tts_id: str = Form(""),
     variant_id: str = Form(""),
-    audio_file: Optional[UploadFile] = File(None),
 ):
     """Align one page audio, persist segments immediately, and return them."""
     if page_index < 0:
@@ -726,20 +531,15 @@ async def video_run_page_align_endpoint(
     target_variant_id = variant_id or tts_id
     if not target_variant_id:
         raise HTTPException(status_code=400, detail="variant_id is required for persistent alignment")
-    if audio_file is not None and audio_file.filename:
-        audio_bytes = await audio_file.read()
-        audio_filename = audio_file.filename or "audio.wav"
-        audio_source_path = None
-    else:
-        try:
-            audio_path = get_video_run_store().get_variant_audio_path(
-                run_id=run_id, page_index=page_index, variant_id=target_variant_id,
-            )
-        except (FileNotFoundError, IndexError):
-            raise HTTPException(status_code=404, detail="找不到此變體的 TTS 音訊")
-        audio_bytes = None
-        audio_filename = audio_path.name
-        audio_source_path = str(audio_path)
+    try:
+        audio_path = get_video_run_store().get_variant_audio_path(
+            run_id=run_id, page_index=page_index, variant_id=target_variant_id,
+        )
+    except (FileNotFoundError, IndexError):
+        raise HTTPException(status_code=404, detail="找不到此變體的 TTS 音訊")
+    audio_bytes = None
+    audio_filename = audio_path.name
+    audio_source_path = str(audio_path)
     result = await asyncio.to_thread(
         align_subtitles,
         text=text,
@@ -793,7 +593,7 @@ async def reference_asr_fill_endpoint(
     reference_audio: UploadFile = File(...),
 ):
     try:
-        ref_data = await reference_audio.read()
+        ref_data = await read_upload_limited(reference_audio)
         file_suffix = os.path.splitext(reference_audio.filename or "")[-1] or ".wav"
         ok, text, reason = await asyncio.to_thread(
             transcribe_reference_audio,
@@ -811,540 +611,9 @@ async def reference_asr_fill_endpoint(
         raise HTTPException(status_code=500, detail=f"本地 ASR 代填失敗: {str(e)}")
 
 
-@router.post("/api/video-abstract/subtitle-align")
-async def subtitle_align_endpoint(
-    text: str = Form(""),
-    language: str = Form("auto"),
-    alignment_mode: str = Form("auto"),
-    split_min_chars: int = Form(10),
-    split_max_chars: int = Form(32),
-    enable_pause_split: bool = Form(False),
-    pause_threshold_ms: int = Form(320),
-    audio_file: UploadFile = File(...),
-):
-    """
-    臨時字幕對齊端點：接收音檔 + 可選文字，回傳對齊後 segments 與 SRT。
-    自動策略：
-      - 有文字：Qwen3-ForcedAligner（強制對齊）
-      - 無文字：Qwen3-ASR + ForcedAligner
-    """
-    try:
-        audio_bytes = await audio_file.read()
-        result = await asyncio.to_thread(
-            align_subtitles,
-            text=text,
-            audio_bytes=audio_bytes,
-            audio_filename=audio_file.filename or "audio.wav",
-            language=language,
-            alignment_mode=alignment_mode,
-            split_min_chars=split_min_chars,
-            split_max_chars=split_max_chars,
-            enable_pause_split=enable_pause_split,
-            pause_threshold_ms=pause_threshold_ms,
-        )
-        _purge_alignment_cache()
-        alignment_id = _make_alignment_id(audio_bytes, text, result.backend)
-        _ALIGNMENT_CACHE[alignment_id] = {
-            "ts": time.time(),
-            "segments": result.segments,
-            "backend": result.backend,
-            "text": text,
-            "readable_chunks": result.readable_chunks or [],
-        }
-        return JSONResponse(
-            {
-                "alignment_id": alignment_id,
-                "segments": result.segments,
-                "srt": result.srt,
-                "backend": result.backend,
-                "audio_duration": result.audio_duration,
-                "readable_chunks": result.readable_chunks or [],
-                "warning": result.warning or "",
-                "match_ratio": result.match_ratio,
-            }
-        )
-    except Exception as e:
-        logger.error(f"[Subtitle Align] failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"字幕對齊失敗: {str(e)}")
-
-
-@router.post("/api/video-abstract/render-subtitle-video")
-async def render_subtitle_video_endpoint(
-    audio_file: UploadFile = File(...),
-    slide_image: UploadFile | None = File(None),
-    segments_json: str = Form(""),
-    alignment_id: str = Form(""),
-    subtitle_style: str = Form("bg-dark"),
-    enable_highlight: str = Form("true"),
-    font_size: int = Form(20),
-    bg_opacity: int = Form(68),
-    align_backend: str = Form(""),
-):
-    """Deprecated endpoint. Use /api/video-abstract/render-subtitle-ass-video."""
-    raise HTTPException(
-        status_code=410,
-        detail="render-subtitle-video 已停用。請改用 render-subtitle-ass-video。",
-    )
-    try:
-        import json as _json
-
-        request_start_ts = time.time()
-        logger.info(f"[Render Subtitle Video] request received ts={request_start_ts}")
-
-        audio_bytes = await audio_file.read()
-        after_read_ts = time.time()
-        logger.info(f"[Render Subtitle Video] files read ts={after_read_ts} elapsed={after_read_ts-request_start_ts:.3f}s")
-        slide_bytes = await slide_image.read() if slide_image is not None else b""
-        segments = []
-        resolved_backend = str(align_backend or "")
-        _purge_alignment_cache()
-        if alignment_id and alignment_id in _ALIGNMENT_CACHE:
-            cache_item = _ALIGNMENT_CACHE.get(alignment_id, {})
-            segments = cache_item.get("segments") or []
-            if not resolved_backend:
-                resolved_backend = str(cache_item.get("backend") or "")
-        elif segments_json:
-            segments = _json.loads(segments_json)
-        if not isinstance(segments, list) or len(segments) == 0:
-            raise HTTPException(status_code=400, detail="缺少可用字幕時間軸（segments/alignment_id）")
-
-        segments_resolved_ts = time.time()
-        logger.info(f"[Render Subtitle Video] segments resolved ts={segments_resolved_ts} elapsed={segments_resolved_ts-request_start_ts:.3f}s segments={len(segments)} backend={resolved_backend}")
-
-        # -- 寫入暫存檔 --
-        tmp_dir = tempfile.mkdtemp()
-        audio_path = os.path.join(tmp_dir, "audio" + (os.path.splitext(audio_file.filename or "audio.wav")[-1] or ".wav"))
-        slide_path = os.path.join(tmp_dir, "slide_input.png")
-        ass_path = os.path.join(tmp_dir, "subtitles.ass")
-        output_path = os.path.join(tmp_dir, "subtitle_video.mp4")
-
-        with open(audio_path, "wb") as f:
-            f.write(audio_bytes)
-        canvas_w, canvas_h = 1280, 720
-        if slide_bytes:
-            with open(slide_path, "wb") as f:
-                f.write(slide_bytes)
-            try:
-                with Image.open(io.BytesIO(slide_bytes)) as im:
-                    iw, ih = im.size
-                if iw and ih:
-                    canvas_w, canvas_h = int(iw), int(ih)
-            except Exception:
-                pass
-
-        # -- 取得音頻時長 --
-        probe = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", audio_path],
-            capture_output=True, text=True, timeout=30
-        )
-        duration = 10.0
-        try:
-            probe_data = _json.loads(probe.stdout)
-            duration = float(probe_data.get("format", {}).get("duration", 10.0))
-        except Exception:
-            pass
-
-        # -- 優先使用 Canvas Renderer（shared layout + skia-canvas） --
-        try:
-            canvas_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "canvas_renderer"))
-            canvas_render_js = os.path.join(canvas_dir, "render.mjs")
-            canvas_output_path = os.path.join(tmp_dir, "subtitle_video_canvas.mp4")
-            canvas_input_json = os.path.join(tmp_dir, "canvas_input.json")
-
-            if os.path.exists(canvas_render_js) and slide_bytes and os.path.exists(slide_path):
-                canvas_payload = {
-                    "audioPath": audio_path,
-                    "slidePath": slide_path,
-                    "subtitleStyle": subtitle_style,
-                    "fontSize": int(font_size),
-                    "bgOpacity": int(bg_opacity),
-                    "enableHighlight": str(enable_highlight).lower() in ("true", "1"),
-                    "segments": segments,
-                    "alignBackend": resolved_backend,
-                    "fps": 30,
-                    "width": canvas_w,
-                    "height": canvas_h,
-                }
-                with open(canvas_input_json, "w", encoding="utf-8") as f:
-                    _json.dump(canvas_payload, f, ensure_ascii=False)
-
-                canvas_called_ts = time.time()
-                logger.info(f"[Render Subtitle Video] calling canvas renderer ts={canvas_called_ts} elapsed={canvas_called_ts-request_start_ts:.3f}s")
-
-                canvas_proc = subprocess.run(
-                    ["node", canvas_render_js, canvas_input_json, canvas_output_path],
-                    cwd=canvas_dir,
-                    capture_output=True,
-                    text=True,
-                    timeout=900,
-                )
-                canvas_done_ts = time.time()
-                logger.info(f"[Render Subtitle Video] canvas renderer returned code={canvas_proc.returncode} ts={canvas_done_ts} elapsed={canvas_done_ts-request_start_ts:.3f}s")
-
-                if canvas_proc.returncode == 0 and os.path.exists(canvas_output_path):
-                    with open(canvas_output_path, "rb") as f:
-                        video_bytes = f.read()
-                    resp_ts = time.time()
-                    headers = {
-                        "Content-Disposition": "attachment; filename=subtitle_video.mp4",
-                        "X-Subtitle-Render-Version": "canvas-skia-v1",
-                        "X-Subtitle-Style-Applied": subtitle_style,
-                        "X-Server-Received-Ts": f"{request_start_ts}",
-                        "X-Segments-Resolved-Ts": f"{segments_resolved_ts}",
-                        "X-Canvas-Called-Ts": f"{canvas_called_ts}",
-                        "X-Canvas-Done-Ts": f"{canvas_done_ts}",
-                        "X-Server-Response-Ts": f"{resp_ts}",
-                    }
-                    logger.info(f"[Render Subtitle Video] responding ts={resp_ts} elapsed={resp_ts-request_start_ts:.3f}s headers={headers}")
-                    return Response(
-                        content=video_bytes,
-                        media_type="video/mp4",
-                        headers=headers,
-                    )
-                else:
-                    logger.warning(
-                        "[Render Subtitle Video] canvas renderer failed, fallback to remotion: %s",
-                        (canvas_proc.stderr or canvas_proc.stdout or "unknown")[:500],
-                    )
-        except Exception as canvas_err:
-            logger.warning(f"[Render Subtitle Video] canvas renderer exception, fallback to remotion: {canvas_err}")
-
-        # -- 次優先使用 Remotion（與 WebUI CSS 行為較一致） --
-        try:
-            remotion_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "remotion_renderer"))
-            remotion_render_js = os.path.join(remotion_dir, "render.mjs")
-            remotion_output_path = os.path.join(tmp_dir, "subtitle_video_remotion.mp4")
-            remotion_input_json = os.path.join(tmp_dir, "remotion_input.json")
-
-            if os.path.exists(remotion_render_js) and slide_bytes and os.path.exists(slide_path):
-                remotion_payload = {
-                    "audioPath": audio_path,
-                    "slidePath": slide_path,
-                    "subtitleStyle": subtitle_style,
-                    "fontSize": int(font_size),
-                    "bgOpacity": int(bg_opacity),
-                    "enableHighlight": str(enable_highlight).lower() in ("true", "1"),
-                    "segments": segments,
-                }
-                with open(remotion_input_json, "w", encoding="utf-8") as f:
-                    _json.dump(remotion_payload, f, ensure_ascii=False)
-
-                remotion_proc = subprocess.run(
-                    ["node", remotion_render_js, remotion_input_json, remotion_output_path],
-                    cwd=remotion_dir,
-                    capture_output=True,
-                    text=True,
-                    timeout=900,
-                )
-                if remotion_proc.returncode == 0 and os.path.exists(remotion_output_path):
-                    with open(remotion_output_path, "rb") as f:
-                        video_bytes = f.read()
-                    return Response(
-                        content=video_bytes,
-                        media_type="video/mp4",
-                        headers={
-                            "Content-Disposition": "attachment; filename=subtitle_video.mp4",
-                            "X-Subtitle-Render-Version": "remotion-v1",
-                            "X-Subtitle-Style-Applied": subtitle_style,
-                        },
-                    )
-                else:
-                    logger.warning(
-                        "[Render Subtitle Video] remotion failed, fallback to ass: %s",
-                        (remotion_proc.stderr or remotion_proc.stdout or "unknown")[:500],
-                    )
-        except Exception as remotion_err:
-            logger.warning(f"[Render Subtitle Video] remotion exception, fallback to ass: {remotion_err}")
-
-        # 輸出解析度：僅字幕+音訊，採 1280x720 以降低生成成本
-        W, H = 1280, 720
-        do_highlight = str(enable_highlight).lower() in ("true", "1")
-        scaled_font_size = max(11, int(font_size))
-
-        def _to_ass_time(sec: float) -> str:
-            sec = max(0.0, float(sec or 0.0))
-            h = int(sec // 3600)
-            m = int((sec % 3600) // 60)
-            s = int(sec % 60)
-            cs = int(round((sec - int(sec)) * 100))
-            if cs >= 100:
-                s += 1
-                cs = 0
-            return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
-
-        def _ass_escape(text: str) -> str:
-            src = str(text or "")
-            src = src.replace("\\", r"\\").replace("{", r"\{").replace("}", r"\}")
-            src = src.replace("\r\n", "\n").replace("\r", "\n")
-            return src.replace("\n", r"\N")
-
-        def _ass_color_from_rgb(r: int, g: int, b: int) -> str:
-            return f"&H{b:02X}{g:02X}{r:02X}&"
-
-        def _ass_color_from_argb(a: int, r: int, g: int, b: int) -> str:
-            aa = max(0, min(255, int(a)))
-            return f"&H{aa:02X}{b:02X}{g:02X}{r:02X}&"
-
-        def _style_for_mode(mode: str):
-            opacity = max(0, min(100, int(bg_opacity)))
-            alpha = int(round((100 - opacity) * 255 / 100))
-            base = {
-                "fontname": "Noto Sans CJK TC",
-                "fontsize": scaled_font_size,
-                "primary": _ass_color_from_rgb(255, 255, 255),
-                # Secondary color is not used by our current highlight strategy.
-                # Keep it same as primary to avoid renderer-specific karaoke surprises.
-                "secondary": _ass_color_from_rgb(255, 255, 255),
-                "outline": _ass_color_from_rgb(0, 0, 0),
-                "back": _ass_color_from_argb(alpha, 0, 0, 0),
-                "bold": 0,
-                "border_style": 1,
-                "outline_w": 0,
-                "shadow": 0,
-            }
-            if mode == "stroke-dark":
-                base.update({"bold": -1, "outline_w": 2.0, "shadow": 0})
-            elif mode == "stroke-light":
-                base.update({"bold": -1, "outline": _ass_color_from_rgb(156, 163, 175), "outline_w": 2.0, "shadow": 0})
-            elif mode == "bg-gray":
-                # Tight opaque box around subtitle glyphs (not full-width bar)
-                base.update({
-                    "border_style": 3,
-                    "outline_w": 1.0,
-                    "outline": _ass_color_from_argb(alpha, 128, 128, 128),
-                    "back": _ass_color_from_argb(alpha, 128, 128, 128),
-                })
-            else:
-                base.update({
-                    "border_style": 3,
-                    "outline_w": 1.0,
-                    "outline": _ass_color_from_argb(alpha, 0, 0, 0),
-                    "back": _ass_color_from_argb(alpha, 0, 0, 0),
-                })
-            return base
-
-        def _build_seg_plain_text(seg: dict) -> str:
-            text = str(seg.get("text", "") or "")
-            if text.strip():
-                return text
-            words = seg.get("words") or []
-            return "".join(str(w.get("text", "")) for w in words)
-
-        def _is_punc_or_space(s: str) -> bool:
-            if not s:
-                return True
-            puncts = set("，。！？；：「」『』（）、,.!?;:'\"()[]{} \n\t\r")
-            return all(ch in puncts for ch in s)
-
-        def _build_highlight_events(seg: dict):
-            # Return [(start, end, ass_text)] where ass_text already escaped/override-tagged.
-            # This mimics WebUI behavior: normal text white, only active word yellow.
-            words = seg.get("words") or []
-            if not words:
-                start = float(seg.get("start", 0.0) or 0.0)
-                end = float(seg.get("end", start + 0.2) or (start + 0.2))
-                if end <= start:
-                    end = start + 0.2
-                return [(start, end, _ass_escape(_build_seg_plain_text(seg)))]
-
-            full_text = _build_seg_plain_text(seg)
-            seg_start = float(seg.get("start", 0.0) or 0.0)
-            seg_end = float(seg.get("end", seg_start + 0.2) or (seg_start + 0.2))
-            if seg_end <= seg_start:
-                seg_end = seg_start + 0.2
-
-            raw_tokens = []
-            for w in words:
-                text = str(w.get("text", ""))
-                ws = float(w.get("start", seg_start) or seg_start)
-                we = float(w.get("end", ws) or ws)
-                if not text:
-                    continue
-                raw_tokens.append({"text": text, "start": ws, "end": we})
-
-            if not raw_tokens:
-                return [(seg_start, seg_end, _ass_escape(full_text))]
-
-            # Build a monotonic non-overlapping timeline to avoid ASS multi-event overlap artifacts.
-            n = max(1, len(raw_tokens))
-            seg_dur = max(0.001, seg_end - seg_start)
-            min_dur = max(0.02, min(0.09, (seg_dur / n) * 0.9))
-
-            tokens = []
-            last_end = seg_start
-            for tk in raw_tokens:
-                t = str(tk["text"])
-                ws = max(seg_start, float(tk["start"]))
-                we = min(seg_end, float(tk["end"]))
-                if ws < last_end:
-                    ws = last_end
-                if we <= ws:
-                    we = min(seg_end, ws + min_dur)
-                if we <= ws:
-                    continue
-                tokens.append({"text": t, "start": ws, "end": we})
-                last_end = we
-
-            if not tokens:
-                return [(seg_start, seg_end, _ass_escape(full_text))]
-
-            # Map token text back to full subtitle text indices.
-            mapped = []
-            cursor = 0
-            for tk in tokens:
-                t = tk["text"]
-                pos = full_text.find(t, cursor)
-                if pos < 0:
-                    pos = cursor
-                s_idx = max(0, min(len(full_text), pos))
-                e_idx = max(s_idx, min(len(full_text), s_idx + len(t)))
-                cursor = e_idx
-                mapped.append((tk["start"], tk["end"], t, s_idx, e_idx))
-
-            white = "&HFFFFFF&"
-            yellow = "&H24BFFB&"
-            events = []
-            for ws, we, t, s_idx, e_idx in mapped:
-                if _is_punc_or_space(t):
-                    events.append((ws, we, _ass_escape(full_text)))
-                    continue
-                left = _ass_escape(full_text[:s_idx])
-                mid = _ass_escape(full_text[s_idx:e_idx])
-                right = _ass_escape(full_text[e_idx:])
-                ass_text = (
-                    r"{\1c" + white + "}" +
-                    left +
-                    r"{\1c" + yellow + "}" +
-                    mid +
-                    r"{\1c" + white + "}" +
-                    right
-                )
-                events.append((ws, we, ass_text))
-
-            if not events:
-                start = float(seg.get("start", 0.0) or 0.0)
-                end = float(seg.get("end", start + 0.2) or (start + 0.2))
-                if end <= start:
-                    end = start + 0.2
-                return [(start, end, _ass_escape(full_text))]
-            return events
-
-        style = _style_for_mode(subtitle_style)
-        ass_lines = [
-            "[Script Info]",
-            "ScriptType: v4.00+",
-            "PlayResX: 1280",
-            "PlayResY: 720",
-            "ScaledBorderAndShadow: yes",
-            "",
-            "[V4+ Styles]",
-            "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,"
-            "Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,"
-            "Alignment,MarginL,MarginR,MarginV,Encoding",
-            (
-                f"Style: Default,{style['fontname']},{style['fontsize']},{style['primary']},{style['secondary']},"
-                f"{style['outline']},{style['back']},{style['bold']},0,0,0,100,100,0,0,{style['border_style']},"
-                f"{style['outline_w']},{style['shadow']},2,80,80,54,1"
-            ),
-            "",
-            "[Events]",
-            "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text",
-        ]
-        for seg in segments:
-            if do_highlight:
-                # Base text always visible throughout segment to prevent flicker/gap disappearance.
-                seg_start = float(seg.get("start", 0.0) or 0.0)
-                seg_end = float(seg.get("end", seg_start + 0.2) or (seg_start + 0.2))
-                if seg_end <= seg_start:
-                    seg_end = seg_start + 0.2
-                base_text = _ass_escape(_build_seg_plain_text(seg))
-                ass_lines.append(
-                    f"Dialogue: 0,{_to_ass_time(seg_start)},{_to_ass_time(seg_end)},Default,,0,0,0,,{base_text}"
-                )
-                for ev_start, ev_end, ev_text in _build_highlight_events(seg):
-                    ass_lines.append(
-                        f"Dialogue: 1,{_to_ass_time(ev_start)},{_to_ass_time(ev_end)},Default,,0,0,0,,{ev_text}"
-                    )
-            else:
-                start = float(seg.get("start", 0.0) or 0.0)
-                end = float(seg.get("end", start + 0.2) or (start + 0.2))
-                if end <= start:
-                    end = start + 0.2
-                text = _ass_escape(_build_seg_plain_text(seg))
-                ass_lines.append(f"Dialogue: 0,{_to_ass_time(start)},{_to_ass_time(end)},Default,,0,0,0,,{text}")
-
-        with open(ass_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(ass_lines))
-
-        # -- FFmpeg 組合影片（背景圖或黑底 + ASS + 音訊） --
-        if slide_bytes and os.path.exists(slide_path):
-            vf = (
-                f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
-                f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black,"
-                f"ass={ass_path}"
-            )
-            cmd = [
-                "ffmpeg", "-y",
-                "-loop", "1",
-                "-i", slide_path,
-                "-i", audio_path,
-                "-vf", vf,
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
-                "-pix_fmt", "yuv420p",
-                "-shortest",
-                output_path,
-            ]
-        else:
-            vf = f"ass={ass_path}"
-            cmd = [
-                "ffmpeg", "-y",
-                "-f", "lavfi",
-                "-i", f"color=c=black:s={W}x{H}:d={max(duration, 0.2):.3f}",
-                "-i", audio_path,
-                "-vf", vf,
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
-                "-pix_fmt", "yuv420p",
-                "-shortest",
-                output_path,
-            ]
-        result_proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if result_proc.returncode != 0 or not os.path.exists(output_path):
-            err_msg = (result_proc.stderr or result_proc.stdout or "ffmpeg failed").strip()
-            raise RuntimeError(f"FFmpeg 合成失敗: {err_msg[:500]}")
-
-        with open(output_path, "rb") as f:
-            video_bytes = f.read()
-
-        return Response(
-            content=video_bytes,
-            media_type="video/mp4",
-            headers={
-                "Content-Disposition": "attachment; filename=subtitle_video.mp4",
-                "X-Subtitle-Render-Version": "ass-discrete-v2",
-                "X-Subtitle-Style-Applied": subtitle_style,
-            },
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"[Render Subtitle Video] failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"影片生成失敗: {str(e)}")
-    finally:
-        try:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-        except Exception:
-            pass
-
-from backend.app.services.ass_renderer import generate_ass_script
 @router.post("/api/video-abstract/render-subtitle-ass-video")
 async def render_subtitle_ass_video(
-    audio_file: Optional[UploadFile] = File(None),
-    slide_image: Optional[UploadFile] = File(None),
     segments_json: str = Form("[]"),
-    alignment_id: str = Form(""),
     subtitle_style: str = Form("bg-dark"),
     subtitle_mode: str = Form("burn"),
     enable_highlight: bool = Form(True),
@@ -1354,8 +623,8 @@ async def render_subtitle_ass_video(
     bg_opacity: int = Form(68),
     margin_v: int = Form(96),
     align_backend: str = Form(""),
-    run_id: str = Form(""),
-    page_index: int = Form(-1),
+    run_id: str = Form(..., min_length=1),
+    page_index: int = Form(..., ge=0),
     variant_label: str = Form(""),
     tts_id: str = Form(""),
     align_id: str = Form(""),
@@ -1371,52 +640,24 @@ async def render_subtitle_ass_video(
         temp_dir = tempfile.mkdtemp(prefix="slideai_ass_temp_")
         store = get_video_run_store()
         target_variant_id = str(variant_id or tts_id or align_id or "").strip()
-        persistent_request = bool(run_id and page_index >= 0 and target_variant_id)
+        if not isinstance(run_id, str) or not run_id.strip() or not isinstance(page_index, int) or page_index < 0 or not target_variant_id:
+            raise HTTPException(status_code=422, detail="渲染必須指定專案、頁碼與既有音訊變體")
+        try:
+            audio_path = str(store.get_variant_audio_path(
+                run_id=run_id, page_index=page_index, variant_id=target_variant_id,
+            ))
+            from backend.app.services.page_images import ensure_page_images
+            pair = await asyncio.to_thread(ensure_page_images, store, run_id, page_index)
+            slide_path = str(pair["slide"])
+        except (FileNotFoundError, IndexError):
+            raise HTTPException(status_code=404, detail="找不到專案頁面或變體音訊")
 
-        audio_bytes = None
-        if persistent_request:
-            try:
-                audio_path = str(store.get_variant_audio_path(
-                    run_id=run_id, page_index=page_index, variant_id=target_variant_id,
-                ))
-            except (FileNotFoundError, IndexError):
-                raise HTTPException(status_code=404, detail="找不到此變體的 TTS 音訊")
-        else:
-            if audio_file is None or not audio_file.filename:
-                raise HTTPException(status_code=400, detail="請上傳音檔")
-            audio_bytes = await audio_file.read()
-            audio_suffix = os.path.splitext(audio_file.filename or "audio.wav")[1] or ".wav"
-            audio_path = os.path.join(temp_dir, "audio" + audio_suffix)
-            with open(audio_path, "wb") as f:
-                f.write(audio_bytes)
-
-        slide_bytes = None
-        if persistent_request:
-            try:
-                slide_path = str(store.get_page_slide_path(run_id=run_id, page_index=page_index))
-            except (FileNotFoundError, IndexError):
-                raise HTTPException(status_code=404, detail="找不到本頁投影片背景")
-        else:
-            slide_path = os.path.join(temp_dir, "slide.png")
-            if slide_image and slide_image.filename:
-                slide_bytes = await slide_image.read()
-                with open(slide_path, "wb") as f:
-                    f.write(slide_bytes)
-            else:
-                from PIL import Image
-                Image.new('RGB', (1920, 1080), color=(0, 255, 0)).save(slide_path)
-
-        segments_list = []
-        if segments_json and segments_json != "[]":
-            try:
-                segments_list = json.loads(segments_json)
-            except Exception:
-                pass
-
-        if not segments_list:
-            if alignment_id and alignment_id in _ALIGNMENT_CACHE:
-                cache_item = _ALIGNMENT_CACHE.get(alignment_id, {})
-                segments_list = cache_item.get("segments", [])
+        try:
+            segments_list = json.loads(segments_json or "[]")
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=422, detail="字幕時間軸必須是有效 JSON")
+        if not isinstance(segments_list, list) or len(segments_list) > 50000 or any(not isinstance(item, dict) for item in segments_list):
+            raise HTTPException(status_code=422, detail="字幕時間軸必須是段落物件陣列（最多 50000 段）")
 
         subtitle_mode = str(subtitle_mode or "burn").strip().lower()
         if subtitle_mode not in {"none", "sidecar", "burn"}:
@@ -1467,7 +708,13 @@ async def render_subtitle_ass_video(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        stdout_data, stderr_data = await proc.communicate()
+        try:
+            stdout_data, stderr_data = await asyncio.wait_for(proc.communicate(), timeout=1800)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            if proc.returncode is None:
+                proc.kill()
+            await proc.communicate()
+            raise
         if proc.returncode != 0:
             err_text = (stderr_data or b"").decode(errors='ignore')
             logger.error(f"ASS FFmpeg Failed: {err_text}")
@@ -1487,8 +734,8 @@ async def render_subtitle_ass_video(
                 run_id=run_id,
                 page_index=page_index,
                 video_source_path=out_mp4,
-                audio_bytes=None if tts_id else audio_bytes,
-                slide_bytes=None if persistent_request else slide_bytes,
+                audio_bytes=None,
+                slide_bytes=None,
                 segments=segments_list,
                 ass_content=ass_content,
                 settings={
@@ -1502,7 +749,7 @@ async def render_subtitle_ass_video(
                     "margin_v": margin_v,
                     "align_backend": align_backend,
                     "tts_id": tts_id,
-                    "align_id": align_id or alignment_id,
+                    "align_id": align_id,
                     "tts_voice": tts_voice,
                     "tts_speed": tts_speed,
                     "selected_voice_key": selected_voice_key,
@@ -1517,14 +764,7 @@ async def render_subtitle_ass_video(
         if persisted_video_path and os.path.isfile(persisted_video_path):
             return FileResponse(persisted_video_path, media_type="video/mp4", headers=headers)
 
-        with open(out_mp4, "rb") as f:
-            video_bytes = f.read()
-
-        return Response(
-            content=video_bytes,
-            media_type="video/mp4",
-            headers=headers,
-        )
+        raise HTTPException(status_code=500, detail="渲染成果未成功保存")
 
     except HTTPException:
         raise
@@ -1542,7 +782,7 @@ class BatchRenderJobRequest(BaseModel):
     split_min_chars: int = 10
     split_max_chars: int = 32
     tts_voice: str = ""
-    tts_speed: float = 1.0
+    tts_speed: float = Field(default=1.0, ge=0.5, le=2.0)
     selected_voice_key: str = ""
     reference_text: str = ""
     subtitle_settings: dict = Field(default_factory=dict)
@@ -1591,12 +831,12 @@ async def create_agent_video_job(
     if tts_requires_reference_text() and not config.reference_text.strip():
         raise HTTPException(status_code=422, detail="VoxCPM2 語音克隆需要 reference_text")
 
-    pdf_bytes = await pdf.read()
+    pdf_bytes = await read_upload_limited(pdf, MAX_FILE_SIZE)
     if not pdf_bytes or not pdf_bytes.startswith(b"%PDF-"):
         raise HTTPException(status_code=400, detail="pdf 必須是有效的 PDF 檔案")
     if len(pdf_bytes) > MAX_FILE_SIZE:
         raise HTTPException(status_code=413, detail=f"PDF 不可超過 {MAX_FILE_SIZE // 1024 // 1024}MB")
-    reference_bytes = await reference_audio.read()
+    reference_bytes = await read_upload_limited(reference_audio)
     if not reference_bytes:
         raise HTTPException(status_code=400, detail="reference_audio 不可為空")
 
@@ -1762,8 +1002,12 @@ async def _run_persistent_batch_job(run_id: str, job_id: str) -> None:
             _BATCH_ACTIVE_JOB = (str(run_id), str(job_id))
             job = store.load_job(run_id=run_id, job_id=job_id)
             payload = job.get("payload") or {}
-            manifest = store.load_manifest(run_id)
-            pages = manifest.get("pages") or []
+            snapshot = job.get("input_snapshot") or {}
+            if "scripts" not in snapshot:
+                raise ValueError("舊工作缺少輸入快照，請使用目前設定建立新的渲染工作。")
+            pages = [{"script": text} for text in snapshot["scripts"]]
+            reference_path = Path(str(snapshot.get("reference_audio") or ""))
+            reference_bytes = await asyncio.to_thread(reference_path.read_bytes) if reference_path.is_file() else None
             requested = payload.get("page_indexes") or []
             page_indexes = []
             for raw_index in requested:
@@ -1796,13 +1040,16 @@ async def _run_persistent_batch_job(run_id: str, job_id: str) -> None:
                     else:
                         raise FileNotFoundError
                 except (FileNotFoundError, IndexError):
+                    if not reference_bytes:
+                        raise ValueError("上次工作的參考音檔不存在，請重新建立渲染工作。")
+                    state = {}  # Missing audio invalidates every downstream stage.
                     response = await video_run_page_tts_endpoint(
                         run_id=run_id,
                         page_index=page_index,
                         text=str(pages[page_index].get("script") or ""),
                         voice=str(payload.get("tts_voice") or ""),
                         speed=float(payload.get("tts_speed") or 1.0),
-                        reference_audio=None,
+                        reference_audio=UploadFile(file=io.BytesIO(reference_bytes), filename=reference_path.name),
                         reference_text=str(payload.get("reference_text") or ""),
                         selected_voice_key=str(payload.get("selected_voice_key") or ""),
                         response_mode="json",
@@ -1816,7 +1063,8 @@ async def _run_persistent_batch_job(run_id: str, job_id: str) -> None:
                         "stage_total": len(page_indexes),
                         "current_page_index": page_index,
                         "pages": {str(page_index): {
-                            **state, "variant_id": variant_id, "status": "tts_ready",
+                            **state, "variant_id": variant_id,
+                            "status": state.get("status") if state.get("status") in {"align_ready", "rendered"} else "tts_ready",
                             "stage_index": order, "stage_total": len(page_indexes),
                         }},
                     },
@@ -1847,6 +1095,7 @@ async def _run_persistent_batch_job(run_id: str, job_id: str) -> None:
                         align_backend = str(((variant.get("alignment") or {}).get("metadata") or {}).get("backend") or "")
                         warning = str(((variant.get("alignment") or {}).get("metadata") or {}).get("warning") or "")
                     else:
+                        state = {**state, "status": "tts_ready"}
                         response = await video_run_page_align_endpoint(
                             run_id=run_id,
                             page_index=page_index,
@@ -1859,7 +1108,6 @@ async def _run_persistent_batch_job(run_id: str, job_id: str) -> None:
                             pause_threshold_ms=320,
                             tts_id=variant_id,
                             variant_id=variant_id,
-                            audio_file=None,
                         )
                         data = json.loads(bytes(response.body).decode("utf-8"))
                         segments = data.get("segments") or []
@@ -1872,7 +1120,8 @@ async def _run_persistent_batch_job(run_id: str, job_id: str) -> None:
                             "stage_total": len(page_indexes),
                             "current_page_index": page_index,
                             "pages": {str(page_index): {
-                                **state, "variant_id": variant_id, "status": "align_ready",
+                                **state, "variant_id": variant_id,
+                                "status": "rendered" if state.get("status") == "rendered" else "align_ready",
                                 "align_backend": align_backend, "warning": warning,
                                 "stage_index": order, "stage_total": len(page_indexes),
                             }},
@@ -1917,10 +1166,7 @@ async def _run_persistent_batch_job(run_id: str, job_id: str) -> None:
                     if segments_path.is_file():
                         segments = json.loads(segments_path.read_text(encoding="utf-8")).get("segments") or []
                 await render_subtitle_ass_video(
-                    audio_file=None,
-                    slide_image=None,
                     segments_json=json.dumps(segments, ensure_ascii=False),
-                    alignment_id="",
                     subtitle_style="bg-dark",
                     subtitle_mode=subtitle_mode,
                     enable_highlight=bool(style.get("enable_highlight", False)),
@@ -1954,6 +1200,8 @@ async def _run_persistent_batch_job(run_id: str, job_id: str) -> None:
                     },
                 )
 
+            if _job_cancel_requested(run_id, job_id):
+                raise asyncio.CancelledError
             result: dict = {}
             if bool(payload.get("auto_merge")):
                 store.update_job(
@@ -2003,9 +1251,11 @@ async def _run_persistent_batch_job(run_id: str, job_id: str) -> None:
                 },
             )
     except asyncio.CancelledError:
+        cancelled = _job_cancel_requested(run_id, job_id)
+        status = "cancelled" if cancelled else "interrupted"
         store.update_job(
             run_id=run_id, job_id=job_id,
-            updates={"status": "cancelled", "stage": "cancelled", "cancel_requested": True},
+            updates={"status": status, "stage": status, "cancel_requested": cancelled},
         )
     except Exception as exc:
         logger.error("[BatchJob] run=%s job=%s failed: %s", run_id, job_id, exc, exc_info=True)
@@ -2029,21 +1279,18 @@ def _start_batch_job_task(run_id: str, job_id: str) -> None:
 
 
 def recover_persistent_batch_jobs() -> int:
-    """Recover queued/interrupted jobs in their original creation order."""
+    """Mark orphaned work for an explicit one-time recovery decision in the UI."""
     store = get_video_run_store()
     jobs = store.list_all_jobs(statuses={"queued", "running"})
     for job in jobs:
-        run_id = str(job.get("run_id") or "")
-        job_id = str(job.get("job_id") or "")
-        if not run_id or not job_id:
-            continue
-        if job.get("status") == "running":
-            store.update_job(
-                run_id=run_id,
-                job_id=job_id,
-                updates={"status": "queued", "stage": "queued", "error": ""},
-            )
-        _start_batch_job_task(run_id, job_id)
+        recoverable = "scripts" in (job.get("input_snapshot") or {})
+        cancelled = bool(job.get("cancel_requested"))
+        status = "cancelled" if cancelled else ("interrupted" if recoverable else "failed")
+        store.update_job(
+            run_id=job["run_id"], job_id=job["job_id"],
+            updates={"status": status, "stage": status,
+                     "error": "" if recoverable or cancelled else "舊工作缺少輸入快照，請重新建立渲染工作。"},
+        )
     return len(jobs)
 
 
@@ -2055,6 +1302,12 @@ async def create_batch_render_job(run_id: str, request: BatchRenderJobRequest):
             if existing.get("status") in {"queued", "running"}:
                 _start_batch_job_task(run_id, str(existing["job_id"]))
                 return JSONResponse(existing, status_code=202)
+        # Starting a new request supersedes unaccepted recovery prompts.
+        for existing in store.list_jobs(run_id=run_id):
+            if existing.get("status") == "interrupted":
+                store.update_job(run_id=run_id, job_id=existing["job_id"], updates={
+                    "status": "cancelled", "stage": "cancelled", "cancel_requested": True,
+                })
         job = store.create_job(run_id=run_id, payload=request.model_dump())
         _start_batch_job_task(run_id, str(job["job_id"]))
         return JSONResponse(job, status_code=202)
@@ -2101,7 +1354,7 @@ async def get_current_batch_render_job(run_id: str):
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Run not found")
     for job in jobs:
-        if job.get("status") in {"queued", "running"}:
+        if job.get("status") in {"queued", "running", "interrupted"}:
             job_id = str(job.get("job_id") or "")
             return JSONResponse({**job, "queue": _batch_queue_metadata(run_id, job_id)})
     return Response(status_code=204)
@@ -2135,8 +1388,17 @@ async def cancel_batch_render_job(run_id: str, job_id: str):
 
 @router.post("/api/video-runs/{run_id}/jobs/{job_id}/resume")
 async def resume_batch_render_job(run_id: str, job_id: str):
+    store = get_video_run_store()
     try:
-        job = get_video_run_store().update_job(
+        # No await before task registration: decisions serialize on this event loop.
+        job = store.load_job(run_id=run_id, job_id=job_id)
+        if job.get("status") in {"queued", "running"}:
+            return JSONResponse(job, status_code=202)
+        if job.get("status") != "interrupted":
+            raise HTTPException(status_code=409, detail="只有意外中斷的工作可以恢復；請建立新的渲染工作。")
+        if "scripts" not in (job.get("input_snapshot") or {}):
+            raise HTTPException(status_code=409, detail="舊工作缺少輸入快照，請重新建立渲染工作。")
+        job = store.update_job(
             run_id=run_id, job_id=job_id,
             updates={"status": "queued", "stage": "queued", "cancel_requested": False, "error": ""},
         )
@@ -2144,49 +1406,3 @@ async def resume_batch_render_job(run_id: str, job_id: str):
         return JSONResponse(job, status_code=202)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Job not found")
-
-
-@router.post("/api/video-abstract/merge-rendered-videos")
-async def merge_rendered_videos(
-    videos: List[UploadFile] = File(...),
-    transitions_enabled: bool = Form(False),
-):
-    """Merge already-rendered page videos in given order and return a downloadable MP4."""
-    if not videos:
-        raise HTTPException(status_code=400, detail="缺少影片片段")
-    temp_dir = tempfile.mkdtemp(prefix="slideai_merge_")
-    try:
-        input_paths = []
-        for i, up in enumerate(videos):
-            name = up.filename or f"part_{i+1}.mp4"
-            ext = os.path.splitext(name)[1] or ".mp4"
-            p = os.path.join(temp_dir, f"part_{i:03d}{ext}")
-            content = await up.read()
-            with open(p, "wb") as f:
-                f.write(content)
-            input_paths.append(p)
-
-        if not input_paths:
-            raise HTTPException(status_code=400, detail="沒有可合併的片段")
-
-        try:
-            out_path, transition_metadata = await merge_video_files(
-                input_paths,
-                temp_dir,
-                transitions_enabled=transitions_enabled,
-            )
-        except (RuntimeError, ValueError) as exc:
-            raise HTTPException(status_code=500, detail=str(exc))
-
-        with open(out_path, "rb") as f:
-            merged_bytes = f.read()
-        return Response(
-            content=merged_bytes,
-            media_type="video/mp4",
-            headers={
-                "Content-Disposition": "attachment; filename=merged_rendered_preview.mp4",
-                "X-Transition-Seed": str(transition_metadata.get("seed") or ""),
-            },
-        )
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)

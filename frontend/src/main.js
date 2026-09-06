@@ -21,9 +21,22 @@ const vuetify = createVuetify({
   },
 });
 
+const getRouterBase = () => {
+  const baseEl = document.querySelector("base");
+  const href = baseEl ? baseEl.getAttribute("href") : "";
+  if (href && href.trim() !== "") {
+    return href;
+  }
+  const path = window?.location?.pathname || "";
+  if (path.startsWith("/apps/slider")) {
+    return "/apps/slider/";
+  }
+  return "/";
+};
+
 const router = createRouter({
-  // 統一使用 history 模式；Docker Nginx 負責 SPA fallback。
-  history: createWebHistory(),
+  // 統一使用 history 模式，自動依據外層 Reverse Proxy (<base>) 調整基礎路徑。
+  history: createWebHistory(getRouterBase()),
   routes,
 });
 

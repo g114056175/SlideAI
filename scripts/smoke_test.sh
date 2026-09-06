@@ -14,7 +14,6 @@ API_BASE="${SLIDEAI_API_BASE:-${FRONTEND_BASE}}"
 FULL=0
 PDF_PATH=""
 RUN_ID=""
-PDF_ID=""
 TEMP_DIR=""
 
 say() { printf '%s\n' "$*"; }
@@ -89,21 +88,15 @@ upload_code="$(
   curl -sS -o "${upload_json}" -w '%{http_code}' \
     -H 'Authorization: Bearer deliberately-invalid-smoke-token' \
     -F "file=@${PDF_PATH};type=application/pdf" \
-    -F 'content_language=zh' \
-    -F 'subtitle_source=none' \
-    -F 'skip_llm=true' \
-    "${API_BASE}/api/video-abstract"
+          "${API_BASE}/api/video-abstract"
 )"
 [[ "${upload_code}" == "200" ]] || fail "local-only PDF upload failed (${upload_code}): $(jq -r '.detail // empty' "${upload_json}")"
 RUN_ID="$(jq -r '.run_id // empty' "${upload_json}")"
-PDF_ID="$(jq -r '.pdf_id // empty' "${upload_json}")"
-[[ -n "${RUN_ID}" && -n "${PDF_ID}" ]] || fail "upload returned no run_id/pdf_id"
+[[ -n "${RUN_ID}" ]] || fail "upload returned no run_id"
 
 slide_image="${TEMP_DIR}/slide.jpg"
-if ! curl -fs "${API_BASE}/api/video-runs/${RUN_ID}/pages/0/image" -o "${slide_image}"; then
-  curl -fsS "${API_BASE}/api/video-runs/${RUN_ID}/thumbnail?page=1" -o "${slide_image}" \
-    || fail "page image failed"
-fi
+curl -fsS "${API_BASE}/api/video-runs/${RUN_ID}/pages/0/image" -o "${slide_image}" \
+  || fail "page image failed"
 file "${slide_image}" | grep -Eq 'JPEG|PNG' || fail "page image is invalid"
 say "PASS: auth-free PDF upload, persistent run and page image"
 
@@ -151,7 +144,6 @@ curl -fsS \
   -F 'split_max_chars=18' \
   -F "tts_id=${variant_id}" \
   -F "variant_id=${variant_id}" \
-  -F "audio_file=@${tts_audio};type=audio/wav" \
   "${API_BASE}/api/video-runs/${RUN_ID}/pages/0/align" -o "${align_json}" \
   || fail "forced alignment failed"
 jq -e '.segments | length > 0' "${align_json}" >/dev/null || fail "alignment returned no segments"
@@ -159,8 +151,6 @@ jq -e '.segments | length > 0' "${align_json}" >/dev/null || fail "alignment ret
 segments="$(jq -c '.segments' "${align_json}")"
 rendered_video="${TEMP_DIR}/rendered.mp4"
 curl -fsS -o "${rendered_video}" \
-  -F "audio_file=@${tts_audio};type=audio/wav" \
-  -F "slide_image=@${slide_image};type=image/jpeg" \
   -F "segments_json=${segments}" \
   -F 'subtitle_mode=burn' \
   -F 'subtitle_style=bg-dark' \
@@ -181,21 +171,22 @@ curl -fsS -o "${rendered_video}" \
   || fail "persistent subtitle render failed"
 ffprobe -v error "${rendered_video}" >/dev/null || fail "rendered MP4 is invalid"
 
-no_subtitle_video="${TEMP_DIR}/no-subtitle.mp4"
-curl -fsS -o "${no_subtitle_video}" \
-  -F "audio_file=@${tts_audio};type=audio/wav" \
-  -F "slide_image=@${slide_image};type=image/jpeg" \
-  -F 'segments_json=[]' \
-  -F 'subtitle_mode=none' \
-  "${API_BASE}/api/video-abstract/render-subtitle-ass-video" \
-  || fail "no-subtitle render failed"
-ffprobe -v error "${no_subtitle_video}" >/dev/null || fail "no-subtitle MP4 is invalid"
-
 curl -fsS \
   "${API_BASE}/api/video-runs/${RUN_ID}/pages/0/variants/${variant_id}/subtitles.srt" \
   -o "${TEMP_DIR}/subtitles.srt" \
   || fail "sidecar SRT download failed"
 [[ -s "${TEMP_DIR}/subtitles.srt" ]] || fail "sidecar SRT is empty"
+
+no_subtitle_video="${TEMP_DIR}/no-subtitle.mp4"
+curl -fsS -o "${no_subtitle_video}" \
+  -F 'segments_json=[]' \
+  -F 'subtitle_mode=none' \
+  -F "run_id=${RUN_ID}" \
+  -F 'page_index=0' \
+  -F "variant_id=${variant_id}" \
+  "${API_BASE}/api/video-abstract/render-subtitle-ass-video" \
+  || fail "no-subtitle render failed"
+ffprobe -v error "${no_subtitle_video}" >/dev/null || fail "no-subtitle MP4 is invalid"
 
 merged_video="${TEMP_DIR}/merged.mp4"
 curl -fsS -o "${merged_video}" \

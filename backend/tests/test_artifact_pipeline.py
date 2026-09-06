@@ -92,7 +92,6 @@ class ArtifactPipelineTests(unittest.TestCase):
         image = Image.new("RGB", (320, 180), "white")
         with (
             patch.object(video, "get_video_run_store", return_value=self.store),
-            patch.object(video, "convert_from_path", return_value=[image]),
         ):
             video._pregenerate_run_thumbnails_safe(self.run_id, str(self.pdf))
             self.assertFalse(self.store.run_dir(self.run_id).exists())
@@ -191,7 +190,7 @@ class ArtifactPipelineTests(unittest.TestCase):
         self.assertIn("修改後第二段。", body["page_text"])
         self.assertGreater(len(synth.call_args.kwargs["reference_audio_bytes"]), 100)
 
-    def test_five_batch_jobs_recover_in_fifo_order_and_report_positions(self):
+    def test_restart_waits_for_confirmation_then_resumes_in_requested_order(self):
         jobs = []
         run_ids = [self.run_id]
         for index in range(4):
@@ -209,6 +208,15 @@ class ArtifactPipelineTests(unittest.TestCase):
             patch.object(video, "_start_batch_job_task", side_effect=lambda run_id, job_id: recovered.append((run_id, job_id))),
         ):
             self.assertEqual(video.recover_persistent_batch_jobs(), 5)
+        self.assertEqual(recovered, [])
+        for job in jobs:
+            self.assertEqual(self.store.load_job(run_id=job["run_id"], job_id=job["job_id"])["status"], "interrupted")
+        with (
+            patch.object(video, "get_video_run_store", return_value=self.store),
+            patch.object(video, "_start_batch_job_task", side_effect=lambda run_id, job_id: recovered.append((run_id, job_id))),
+        ):
+            for job in jobs:
+                asyncio.run(video.resume_batch_render_job(job["run_id"], job["job_id"]))
         self.assertEqual(recovered, [(job["run_id"], job["job_id"]) for job in jobs])
 
         old_active = video._BATCH_ACTIVE_JOB

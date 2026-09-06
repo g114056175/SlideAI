@@ -7,7 +7,7 @@
   >
     <div class="lab-page">
       <!-- Stage A: Keep the familiar upload UI first -->
-      <div v-if="stage === 'upload'" class="upload-stage">
+      <div v-if="stage === 'upload' && !openingProject" class="upload-stage">
         <div class="card upload-card shadow-sm border-0">
           <div class="card-body p-4 p-md-5">
             <h2 class="text-center mb-3 title">AI語音簡報</h2>
@@ -67,7 +67,7 @@
       </div>
 
       <!-- Stage B: Workflow after upload -->
-      <div v-else class="workspace-stage">
+      <div v-else-if="stage === 'workspace' && !openingProject" class="workspace-stage">
         <div class="workflow-card">
           <div class="card-body">
             <div class="tabs-row">
@@ -100,7 +100,8 @@
                 <div v-if="activeTab === 'script'" class="script-view" :style="{ '--preview-height': previewHeight + 'px' }">
                   <div class="preview-panel">
                     <img v-if="selectedSlidePreviewUrl" :src="selectedSlidePreviewUrl" alt="slide" />
-                    <div v-else class="placeholder-text">尚無頁面可預覽</div>
+                    <div v-else class="placeholder-text">{{ selectedSlideImageError || '尚無頁面可預覽' }}</div>
+                    <div v-if="selectedSlideImageError" class="alert alert-danger mt-2 mb-0 py-2">{{ selectedSlideImageError }}</div>
                     <div v-if="selectedSlide" class="script-generation-actions">
                       <div class="script-generation-buttons">
                         <button
@@ -237,7 +238,8 @@
                           preload="metadata"
                         />
                         <img v-if="!selectedRenderedVideoUrl && selectedSlidePreviewUrl" :src="selectedSlidePreviewUrl" alt="final" />
-                        <div v-else-if="!selectedRenderedVideoUrl" class="placeholder-text">尚無頁面可預覽</div>
+                        <div v-else-if="!selectedRenderedVideoUrl" class="placeholder-text">{{ selectedSlideImageError || '尚無頁面可預覽' }}</div>
+                        <div v-if="selectedSlideImageError" class="alert alert-danger mt-2 mb-0 py-2">{{ selectedSlideImageError }}</div>
                       </div>
 
                       <RenderControls
@@ -276,11 +278,15 @@
           </div>
         </div>
       </div>
+      <div v-else-if="openingProject" class="workspace-stage project-loading-stage">
+        <div class="placeholder-text">載入專案圖片中…</div>
+      </div>
     </div>
   </AppShell>
 </template>
 
 <script setup>
+import { createImageQueue } from '../utils/image-queue.js'
 import { computed, onBeforeUnmount, onMounted, ref, watch, nextTick } from 'vue'
 import AppShell from './AppShell.vue'
 import PageVariantPanel from './PageVariantPanel.vue'
@@ -301,6 +307,7 @@ import {
 } from '../../../shared/subtitle-layout/index.js'
 
 const stage = ref('upload')
+const openingProject = ref(false)
 const activeTab = ref('script')
 
 const fileInput = ref(null)
@@ -651,6 +658,7 @@ const selectedSlidePreviewUrl = computed(() => {
   if (isMergedPreviewSelected.value) return mergedPreviewThumbnailUrl.value || slides.value[0]?.thumbnailUrl || ''
   return selectedSlide.value?.previewUrl || selectedSlide.value?.thumbnailUrl || ''
 })
+const selectedSlideImageError = computed(() => selectedSlide.value?.previewError || selectedSlide.value?.thumbnailError || '')
 const selectedRenderedVideoUrl = computed(() => {
   if (isMergedPreviewSelected.value) {
     return mergedPreviewVideoUrl.value || exportVideoUrl(selectedExportVariantId.value) || ''
@@ -1430,7 +1438,7 @@ const disposeSubtitleAssEngine = () => {
   subtitleAssLastContent = ''
 }
 
-const queueSubtitleAssRender = (delayMs = 80) => {
+function queueSubtitleAssRender(delayMs = 80) {
   if (subtitleAssRerenderTimer) clearTimeout(subtitleAssRerenderTimer)
   subtitleAssRerenderTimer = setTimeout(() => {
     renderSubtitleAssPreview()
@@ -1635,54 +1643,111 @@ const createSlideModels = (texts) => texts.map((text, idx) => ({
   scriptText: text || '',
   thumbnailUrl: '',
   previewUrl: '',
+  thumbnailError: '',
+  previewError: '',
 }))
 
-const fetchThumbnail = async (idx, currentPdfId) => {
-  try {
-    const endpoint = getApiEndpoint('/api/video-abstract/thumbnail') + `?pdf_id=${encodeURIComponent(currentPdfId)}&page=${idx + 1}`
-    const res = await fetch(endpoint)
-    if (!res.ok) return
-    const blob = await res.blob()
-    const objectUrl = URL.createObjectURL(blob)
-    tempObjectUrls.value.push(objectUrl)
-    if (slides.value[idx]) slides.value[idx].thumbnailUrl = objectUrl
-  } catch {
-    // ignore
+let imageSession = 0
+const activeImageControllers = new Set()
+const resetImageSession = () => {
+  imageSession += 1
+  for (const controller of activeImageControllers) controller.abort()
+  activeImageControllers.clear()
+}
+const queueImage = createImageQueue(3)
+let imageComponentMounted = true
+
+const imageSessionIsCurrent = (runId, session) => (
+  imageComponentMounted && currentRunId.value === runId && imageSession === session
+)
+
+const waitForImageDecode = (url, timeoutMs = 10000) => new Promise((resolve, reject) => {
+  const image = new Image()
+  let settled = false
+  const finish = (error = null) => {
+    if (settled) return
+    settled = true
+    clearTimeout(timer)
+    image.onload = null
+    image.onerror = null
+    if (error) reject(error)
+    else resolve()
   }
+  const timer = setTimeout(() => finish(new Error('image decode timeout')), timeoutMs)
+  image.onload = () => {
+    // decode() catches decode failures that occur after load in some browsers.
+    if (typeof image.decode === 'function') image.decode().then(() => finish()).catch((err) => finish(err))
+    else finish()
+  }
+  image.onerror = () => finish(new Error('image decode failed'))
+  image.src = url
+})
+
+const enqueueRunImage = (idx, runId, kind, { priority = false, session = imageSession } = {}) => {
+  if (!runId || !slides.value[idx]) return Promise.resolve()
+  const key = `${runId}:${idx}:${kind}:${session}`
+  return queueImage(key, async () => {
+    const slide = slides.value[idx]
+    if (!slide || (kind === 'thumbnail' ? slide.thumbnailUrl : slide.previewUrl)) return
+    if (!imageSessionIsCurrent(runId, session)) return
+    let objectUrl = ''
+    try {
+      const endpoint = kind === 'thumbnail'
+        ? `${getApiEndpoint(`/api/video-runs/${encodeURIComponent(runId)}/thumbnail`)}?page=${idx + 1}`
+        : getApiEndpoint(`/api/video-runs/${encodeURIComponent(runId)}/pages/${idx}/image`)
+      const controller = new AbortController()
+      activeImageControllers.add(controller)
+      const timeout = setTimeout(() => controller.abort(), 15000)
+      let blob
+      try {
+        const res = await fetch(endpoint, { signal: controller.signal })
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        blob = await res.blob()
+      } finally {
+        clearTimeout(timeout)
+        activeImageControllers.delete(controller)
+      }
+      objectUrl = URL.createObjectURL(blob)
+      if (!imageSessionIsCurrent(runId, session)) {
+        URL.revokeObjectURL(objectUrl)
+        return
+      }
+      await waitForImageDecode(objectUrl)
+      if (!imageSessionIsCurrent(runId, session)) {
+        URL.revokeObjectURL(objectUrl)
+        return
+      }
+      tempObjectUrls.value.push(objectUrl)
+      if (kind === 'thumbnail') slide.thumbnailUrl = objectUrl
+      else slide.previewUrl = objectUrl
+      slide[`${kind}Error`] = ''
+    } catch (err) {
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+      if (imageSessionIsCurrent(runId, session) && slides.value[idx]) {
+        slides.value[idx][`${kind}Error`] = `第 ${idx + 1} 頁${kind === 'thumbnail' ? '縮圖' : '預覽圖'}載入失敗，請重試。`
+      }
+      console.warn(`[RunImage:${kind}] load failed:`, err)
+    }
+  }, priority)
+}
+
+const prepareInitialRunImages = (runId, session) => Promise.all([
+  ...(slides.value.length ? [enqueueRunImage(0, runId, 'preview', { session, priority: true })] : []),
+  ...slides.value.map((_, idx) => enqueueRunImage(idx, runId, 'thumbnail', { session })),
+])
+
+const preloadRemainingRunImages = (runId, session) => {
+  slides.value.slice(1).forEach((_, idx) => {
+    enqueueRunImage(idx + 1, runId, 'preview', { session }).catch(() => {})
+  })
 }
 
 const fetchRunThumbnail = async (idx, runId) => {
-  try {
-    const endpoint = getApiEndpoint(`/api/video-runs/${encodeURIComponent(runId)}/pages/${idx}/image`)
-    const res = await fetch(endpoint)
-    if (!res.ok) {
-      const fallback = getApiEndpoint(`/api/video-runs/${encodeURIComponent(runId)}/thumbnail`) + `?page=${idx + 1}`
-      const fallbackRes = await fetch(fallback)
-      if (!fallbackRes.ok) return
-      const blob = await fallbackRes.blob()
-      const objectUrl = URL.createObjectURL(blob)
-      tempObjectUrls.value.push(objectUrl)
-      if (slides.value[idx]) {
-        slides.value[idx].thumbnailUrl = objectUrl
-        slides.value[idx].previewUrl = objectUrl
-      }
-      return
-    }
-    const blob = await res.blob()
-    const objectUrl = URL.createObjectURL(blob)
-    tempObjectUrls.value.push(objectUrl)
-    if (slides.value[idx]) {
-      slides.value[idx].thumbnailUrl = objectUrl
-      slides.value[idx].previewUrl = objectUrl
-    }
-  } catch {
-    // ignore
-  }
+  return enqueueRunImage(idx, runId, 'thumbnail')
 }
 
 const fetchRunPreview = async (idx, runId) => {
-  if (!runId || !slides.value[idx] || slides.value[idx].previewUrl) return
-  await fetchRunThumbnail(idx, runId)
+  return enqueueRunImage(idx, runId, 'preview', { priority: true })
 }
 
 const persistRunScriptsNow = async () => {
@@ -1846,6 +1911,9 @@ watch(activeTab, (tab) => {
 
 const handleShellProjectSelect = async (project) => {
   if (!project?.is_video_run || !project?.run_id) return
+  resetImageSession()
+  const session = imageSession
+  openingProject.value = true
   resetMessages()
   clearProjectSettingsSaveTimer()
   if (scriptSaveTimer) {
@@ -1868,9 +1936,11 @@ const handleShellProjectSelect = async (project) => {
     selectedVariantIds.value = {}
     renderedPageVideos.value = {}
     await resetVoiceToDefault()
+    if (session !== imageSession) return
     currentRunId.value = project.run_id
     const res = await fetch(getApiEndpoint(`/api/video-runs/${encodeURIComponent(project.run_id)}`))
     const manifest = await res.json().catch(() => ({}))
+    if (session !== imageSession) return
     if (!res.ok) throw new Error(manifest?.detail || `載入 run 失敗 (${res.status})`)
     runManifest.value = manifest
     pdfId.value = manifest.pdf_id || null
@@ -1880,6 +1950,8 @@ const handleShellProjectSelect = async (project) => {
       scriptText: page.script || '',
       thumbnailUrl: '',
       previewUrl: '',
+      thumbnailError: '',
+      previewError: '',
     }))
     selectedSlideIndex.value = 0
     selectedVariantIds.value = {}
@@ -1897,14 +1969,14 @@ const handleShellProjectSelect = async (project) => {
       mergedPreviewVideoUrl.value = exportVideoUrl(selectedExport)
       mergedPreviewThumbnailUrl.value = slides.value[0]?.thumbnailUrl || slides.value[0]?.previewUrl || ''
     }
+    await applyProjectSettingsToUi(manifest)
+    if (session !== imageSession) return
+    statusMessage.value = `已載入 ${manifest.display_name || manifest.original_filename || manifest.run_id}。`
+    await prepareInitialRunImages(project.run_id, session)
+    if (session !== imageSession || currentRunId.value !== project.run_id) return
     stage.value = 'workspace'
     activeTab.value = 'preview'
-    await applyProjectSettingsToUi(manifest)
-    statusMessage.value = `已載入 ${manifest.display_name || manifest.original_filename || manifest.run_id}。`
-    fetchRunPreview(0, project.run_id)
-    slides.value.forEach((_, idx) => {
-      fetchRunThumbnail(idx, project.run_id).catch(() => {})
-    })
+    preloadRemainingRunImages(project.run_id, session)
     if (hasMergedPreview.value) {
       mergedPreviewThumbnailUrl.value = mergedPreviewThumbnailUrl.value || slides.value[0]?.thumbnailUrl || slides.value[0]?.previewUrl || ''
     }
@@ -1912,11 +1984,14 @@ const handleShellProjectSelect = async (project) => {
       console.warn('[BatchJob] reattach failed:', err)
     })
   } catch (err) {
-    errorMessage.value = err.message || '載入 run 失敗'
+    if (session === imageSession) errorMessage.value = err.message || '載入 run 失敗'
   } finally {
-    await nextTick()
-    suppressScriptSave.value = false
-    suppressProjectSettingsSave.value = false
+    if (session === imageSession) {
+      openingProject.value = false
+      await nextTick()
+      suppressScriptSave.value = false
+      suppressProjectSettingsSave.value = false
+    }
   }
 }
 
@@ -1952,8 +2027,12 @@ const handleUpload = async () => {
     const data = await res.json().catch(() => ({}))
     if (!res.ok) throw new Error(data?.detail || `上傳失敗 (${res.status})`)
 
+    const runId = typeof data?.run_id === 'string' ? data.run_id.trim() : ''
+    if (!runId) throw new Error('上傳失敗：後端未回傳專案 run_id，請確認後端支援專案工作流程後重試。')
     pdfId.value = data?.pdf_id || null
-    currentRunId.value = data?.run_id || null
+    currentRunId.value = runId
+    resetImageSession()
+    const session = imageSession
     runManifest.value = data?.run || null
     selectedVariantIds.value = {}
     const returnedTexts = Array.isArray(data?.texts) ? data.texts : []
@@ -1975,39 +2054,24 @@ const handleUpload = async () => {
       && data?.model_services_skipped !== true
     )
 
-    if (currentRunId.value) {
-      refreshSidebarRuns()
-      Promise
-        .all(slides.value.map((_, idx) => fetchRunThumbnail(idx, currentRunId.value)))
-        .catch((err) => {
-          console.warn('[RunThumbnail] background fetch failed:', err)
-        })
-      uploadPhase.value = shouldAutoGenerate ? '等待 LLM 回應...' : '載入專案中...'
-      await refreshRunManifest()
-      await nextTick()
-      suppressScriptSave.value = false
-      // subtitle source zh/en: trigger initial script generation via the same
-      // direct-PDF pipeline used by manual "fill all", avoiding old text-extract path.
-      if (shouldAutoGenerate) {
-        await generateScriptsForPages(slides.value.map((_, idx) => idx), { requireConfirm: false, throwOnError: true })
-      }
-      stage.value = 'workspace'
-      activeTab.value = 'script'
-      statusMessage.value = data?.model_services_skipped === true
-        ? `上傳成功，共 ${slides.value.length} 頁；目前為基本前後端模式，已跳過 AI 講稿生成。`
-        : `上傳成功，共 ${slides.value.length} 頁。`
-    } else if (pdfId.value) {
-      Promise
-        .all(slides.value.map((_, idx) => fetchThumbnail(idx, pdfId.value)))
-        .catch((err) => {
-          console.warn('[Thumbnail] legacy background fetch failed:', err)
-        })
-      await nextTick()
-      suppressScriptSave.value = false
-      stage.value = 'workspace'
-      activeTab.value = 'script'
-      statusMessage.value = `上傳成功，共 ${slides.value.length} 頁。`
+    refreshSidebarRuns()
+    uploadPhase.value = shouldAutoGenerate ? '等待 LLM 回應...' : '載入專案中...'
+    await refreshRunManifest()
+    await nextTick()
+    suppressScriptSave.value = false
+    // subtitle source zh/en: trigger initial script generation via the same
+    // direct-PDF pipeline used by manual "fill all", avoiding old text-extract path.
+    if (shouldAutoGenerate) {
+      await generateScriptsForPages(slides.value.map((_, idx) => idx), { requireConfirm: false, throwOnError: true })
     }
+    await prepareInitialRunImages(currentRunId.value, session)
+    if (session !== imageSession) return
+    stage.value = 'workspace'
+    activeTab.value = 'script'
+    preloadRemainingRunImages(currentRunId.value, session)
+    statusMessage.value = data?.model_services_skipped === true
+      ? `上傳成功，共 ${slides.value.length} 頁；目前為基本前後端模式，已跳過 AI 講稿生成。`
+      : `上傳成功，共 ${slides.value.length} 頁。`
   } catch (err) {
     errorMessage.value = err.message || '上傳失敗'
   } finally {
@@ -2071,52 +2135,6 @@ const onRefAudioDrop = (event) => {
   tempObjectUrls.value.push(objectUrl)
   schedulePersistRunSettings({ includeReferenceAudio: true, delay: 200 })
   scheduleQwenTtsWarmup()
-}
-
-const onSubtitleAudioChange = (event) => {
-  const file = event.target.files?.[0] || null
-  subtitleAudioFile.value = file
-  subtitleDemoCurrentTime.value = 0
-  subtitleDemoDuration.value = 0
-  subtitleDemoPlaying.value = false
-  if (subtitleAudioUrl.value) {
-    URL.revokeObjectURL(subtitleAudioUrl.value)
-    subtitleAudioUrl.value = ''
-  }
-  if (file) {
-    const objectUrl = URL.createObjectURL(file)
-    subtitleAudioUrl.value = objectUrl
-    tempObjectUrls.value.push(objectUrl)
-  }
-}
-
-const clearSubtitleAudio = () => {
-  if (subtitleAudioUrl.value) {
-    URL.revokeObjectURL(subtitleAudioUrl.value)
-    subtitleAudioUrl.value = ''
-  }
-  subtitleAudioFile.value = null
-  subtitleAlignedSegments.value = []
-  subtitleDemoCurrentTime.value = 0
-  subtitleDemoDuration.value = 0
-  subtitleDemoPlaying.value = false
-  stopSubtitleClock()
-  subtitleAlignError.value = ''
-  subtitleAlignWarning.value = ''
-  if (subtitleAudioInput.value) subtitleAudioInput.value.value = ''
-}
-
-const onSubtitleAudioDrop = (event) => {
-  const file = event.dataTransfer.files?.[0] || null
-  if (!file) return
-  subtitleAudioFile.value = file
-  subtitleDemoCurrentTime.value = 0
-  subtitleDemoDuration.value = 0
-  subtitleDemoPlaying.value = false
-  if (subtitleAudioUrl.value) URL.revokeObjectURL(subtitleAudioUrl.value)
-  const objectUrl = URL.createObjectURL(file)
-  subtitleAudioUrl.value = objectUrl
-  tempObjectUrls.value.push(objectUrl)
 }
 
 const formatAlignTime = (sec) => {
@@ -2189,74 +2207,6 @@ const onSubtitleDemoSeek = (event) => {
   subtitleDemoCurrentTime.value = t
 }
 
-const generateSubtitleAlignment = async () => {
-  if (!subtitleAudioFile.value) return
-  subtitleAligning.value = true
-  subtitleAligningStage.value = ''
-  subtitleAlignError.value = ''
-  subtitleAlignWarning.value = ''
-  subtitleAlignBackend.value = ''
-  subtitleAlignedSegments.value = []
-  subtitleDemoCurrentTime.value = 0
-  subtitleDemoDuration.value = 0
-  subtitleDemoPlaying.value = false
-
-  try {
-    const formData = new FormData()
-    formData.append('audio_file', subtitleAudioFile.value)
-
-    // 若沒有輸入講稿，先用 ASR 識別並填入文字框
-    let effectiveText = subtitleAlignText.value.trim()
-    if (!effectiveText) {
-      subtitleAligningStage.value = 'ASR 識別中...'
-      try {
-        const asrForm = new FormData()
-        asrForm.append('reference_audio', subtitleAudioFile.value)
-        const asrRes = await fetch(getApiEndpoint('/api/video-abstract/reference-asr'), {
-          method: 'POST',
-          body: asrForm,
-        })
-        if (asrRes.ok) {
-          const asrData = await asrRes.json().catch(() => ({}))
-          if (asrData?.text) {
-            subtitleAlignText.value = asrData.text
-            effectiveText = asrData.text
-          }
-        }
-      } catch (e) {
-        // ASR 失敗 → 不是致命錯誤，就算沒有講稿也繼續對齊
-        console.warn('[Subtitle ASR] failed, proceeding without text:', e)
-      }
-    }
-
-    subtitleAligningStage.value = '字幕對齊中...'
-    formData.append('text', effectiveText)
-    formData.append('split_min_chars', String(DEFAULT_SUBTITLE_SPLIT_MIN_CHARS))
-    formData.append('split_max_chars', String(DEFAULT_SUBTITLE_SPLIT_MAX_CHARS))
-
-    const res = await fetch(getApiEndpoint('/api/video-abstract/subtitle-align'), {
-      method: 'POST',
-      body: formData,
-    })
-    const data = await res.json().catch(() => ({}))
-    if (!res.ok) throw new Error(data?.detail || `字幕對齊失敗 (${res.status})`)
-
-    subtitleAlignedSegments.value = Array.isArray(data?.segments) ? data.segments : []
-    subtitleAlignBackend.value = data?.backend || ''
-    subtitleAlignSrt.value = data?.srt || ''
-    subtitleAlignWarning.value = data?.warning || ''
-    if (subtitleAlignedSegments.value.length > 0) {
-      subtitleTestText.value = subtitleAlignedSegments.value[0].text || subtitleTestText.value
-    }
-  } catch (err) {
-    subtitleAlignError.value = err.message || '字幕對齊失敗'
-  } finally {
-    subtitleAligning.value = false
-    subtitleAligningStage.value = ''
-  }
-}
-
-// TTS \u8a66\u807d\u751f\u6210
 const generateTtsPreview = async () => {
   if (!ttsPreviewText.value.trim()) return
   ttsGenerating.value = true
@@ -2326,6 +2276,8 @@ const fillReferenceTextWithLocalAsr = async () => {
 }
 
 const backToUpload = async () => {
+  resetImageSession()
+  openingProject.value = false
   resetEphemeralUrls()
   if (mergedPreviewVideoUrl.value && mergedPreviewVideoUrl.value.startsWith('blob:')) {
     try { URL.revokeObjectURL(mergedPreviewVideoUrl.value) } catch {}
@@ -2368,6 +2320,8 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  imageComponentMounted = false
+  resetImageSession()
   stopSubtitleClock()
   if (scriptSaveTimer) clearTimeout(scriptSaveTimer)
   window.removeEventListener('keydown', handleKeyDown)

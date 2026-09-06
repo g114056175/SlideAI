@@ -104,9 +104,18 @@ flowchart LR
 
 上傳時會把 PDF 保存到該次 run 的 `input/`，產生頁面預覽並建立 manifest。講稿可以完全手動輸入，也可以交給 Gemini、OpenAI、Claude、OpenRouter、xAI、Groq 或自訂 OpenAI-compatible endpoint。LLM 只負責講稿，不會直接控制檔案路徑或執行任意命令。
 
+自動講稿以逐頁圖片送入模型，支援沒有文字層的 PDF；選擇的模型必須支援圖片輸入。只重新生成一頁時，只讀取並傳送該頁大圖，其他頁面的講稿保留。
+
+每頁固定保存兩張 JPEG：大圖等比例限制在 1920 × 1080 內（品質 90），小圖限制在 320 × 180 內（品質 80）。大圖供預覽、LLM 與影片背景共用；縮圖列只使用小圖。開啟工作區前優先準備全部小圖與第一頁大圖，其餘大圖背景預載。圖片缺失時才補轉 PDF，同頁轉圖共用工作，最多同時執行兩個轉圖程序。既有資料可執行 `backend/.venv/bin/python -m backend.scripts.migrate_page_images data/video_runs` 原地更新；重複執行會沿用已更新圖片，不建立歷史副本。
+
+
 正式批次流程採「階段式」而非逐頁反覆切換模型：先完成所有頁面的 TTS，再釋放 TTS worker；需要字幕時才載入 ForcedAligner，完成對齊後再逐頁渲染。這能減少模型反覆載入時間，也避免 TTS 與對齊同時佔滿 GPU。
 
+WebUI、CLI 與 Agent API 共用同一個持久專案流程：上傳必須回傳 `run_id`，講稿由獨立圖片生成端點處理。已移除無專案的舊縮圖、字幕對齊、渲染與上傳影片合併入口；基本部署模式仍使用同一份前後端，只略過模型生成。
+
 每一頁的 TTS、對齊與影片都會建立 variant。重新生成不會直接覆蓋唯一成果，使用者可以比較、刪除或選回先前版本。批次工作則持久化到 job 檔案，支援取消、失敗資訊與服務重啟後續查。
+
+重新開啟專案時，仍在後端執行的工作會直接接回進度；意外中斷的工作會詢問是否續跑。接受後沿用工作建立時的講稿、設定與參考音檔快照，跳過已完成的階段；取消或關閉提示則放棄該次續跑，但保留已有成果。舊版工作若沒有輸入快照，需重新建立工作。前端每 5 秒查詢一次進度，切換專案或離開工作區時停止查詢。
 
 </details>
 
@@ -205,7 +214,7 @@ data/video_runs/<run-id>/
 └── merged/                 # 合併 MP4、SRT、下載 bundle
 ```
 
-目前是單機／研究室工具，artifact-first 比 SQL 更容易直接檢查、備份、回檔與續跑；每個 run 自帶完整上下文，搬移時不需要重建資料庫關聯。manifest 更新使用程序鎖與原子替換，避免縮圖背景執行緒、批次 worker 和 UI 同時寫入而遺失欄位。舊版帳號、額度、管理員、SQLAlchemy／SQLite 與密碼雜湊層已從正式後端移除；舊前端元件僅保留作為設計紀錄，不掛入正式路由。
+目前是單機／研究室工具，artifact-first 比 SQL 更容易直接檢查、備份、回檔與續跑；每個 run 自帶完整上下文，搬移時不需要重建資料庫關聯。manifest 更新使用程序鎖與原子替換，避免縮圖背景執行緒、批次 worker 和 UI 同時寫入而遺失欄位。舊版帳號、額度、管理員、SQLAlchemy／SQLite 與密碼雜湊層已從正式後端移除；舊會員、管理後台、帳號除錯頁與上一版工作區已移除；歷史介面可從 Git 紀錄查閱。
 
 若未來要重新支援公開註冊、多租戶隔離、跨機 worker、計費或數十萬個專案查詢，應另行設計 PostgreSQL／Redis metadata 層與應用層授權；大型音訊與影片仍應留在檔案或 object storage，而不是恢復舊資料表即直接對外使用。
 
@@ -215,6 +224,8 @@ data/video_runs/<run-id>/
 <summary><strong>9. 建制、模型替換與網路安全邊界</strong></summary>
 
 Docker Compose 管理 Vue 前端與 FastAPI 後端；模型權重由主機路徑唯讀掛載，不寫進 image。TTS、ASR、ForcedAligner 分開 runtime，是為了隔離 Torch、Transformers 與 FlashAttention 版本。`slideai.sh` 建制精靈可下載公開 HF 模型、指定既有路徑、選擇是否建置 Nano-vLLM，以及設定 LLM 與 HF Token。
+
+模型 runtime 的依賴需分別維護；隔離虛擬環境可避免版本衝突，但不會消除依賴漏洞。部分 Qwen 套件鎖定舊版 Transformers，升級前需驗證模型相容性；僅載入可信來源的模型。
 
 provider 可改成本地 command adapter 或商用 API；介面見 [docs/SPEECH_ADAPTERS.md](docs/SPEECH_ADAPTERS.md)。理想的 provider capability 應宣告是否需要參考音檔、參考逐字稿、是否支援克隆及是否直接回傳時間軸。多數本地 TTS 沒有通用且可靠的字詞時間，因此目前仍由 ForcedAligner 統一處理。
 
@@ -232,7 +243,7 @@ Cloudflare 能降低掃描與未授權流量，但不取代應用層登入、權
 <details>
 <summary><strong>10. 主要開發修正與後續方向</strong></summary>
 
-已完成的關鍵修正包括：TTS 模型比較與 Nano-vLLM 相容層；四句 chunk 與繁中／英文斷句；TTS 完批後才切換 ForcedAligner；worker 閒置卸載；字幕三模式；對齊數字／單位修正；ASS 正式輸出；局部音訊重生後重做時間軸；manifest 程序鎖；持久化 batch job、取消與 FIFO；影片串流處理；插入式轉場；單一 `slideai.sh` 建制精靈；動態 port；Agent API；Google 新版 GenAI SDK；以及模型、環境檔與 run artifact 的 Git 排除。
+已完成的關鍵修正包括：TTS 模型比較與 Nano-vLLM 相容層；四句 chunk 與繁中／英文斷句；TTS 完批後才切換 ForcedAligner；worker 閒置卸載；字幕三模式；對齊數字／單位修正；ASS 正式輸出；局部音訊重生後重做時間軸；manifest 程序鎖；持久化 batch job、取消與 FIFO；影片串流處理；插入式轉場；單一 `slideai.sh` 建制精靈；動態 port；Agent API；逐頁圖片 LLM API；以及模型、環境檔與 run artifact 的 Git 排除。
 
 仍值得繼續的方向：
 
@@ -243,7 +254,24 @@ Cloudflare 能降低掃描與未授權流量，但不取代應用層登入、權
 - PDF OCR 聚焦／Zoom 僅在高可信頁面啟用；若無法穩定辨認同類物件，寧可不加效果。
 - 完成手機版工作區；若未來恢復多租戶，重新設計獨立的身分驗證與資料庫層。
 
-部署檢查可執行 `scripts/portability_check.sh` 與 `scripts/smoke_test.sh`；`--full` 會實際載入模型並生成影片。
+開發驗證（專案根目錄執行）：
+
+```bash
+# 已安裝 backend/requirements.txt；測試另需 pytest、pytest-subtests、httpx
+backend/.venv/bin/python -m pytest -q backend/tests
+node --test frontend/tests/*.test.js
+npm --prefix frontend run build
+# 瀏覽器測試另需 npm --prefix backend ci，以及 Chromium：
+(cd backend && npx playwright install chromium)
+node --test frontend/tests/menu-browser.test.mjs
+```
+
+後端渲染測試需要 FFmpeg／ffprobe；未安裝時會跳過相關案例。PDF 轉圖需要 Poppler。
+以上測試不需呼叫付費 LLM 或載入 GPU 模型。
+部署檢查可執行 `scripts/portability_check.sh` 與 `scripts/smoke_test.sh`；
+`scripts/smoke_test.sh --full --pdf /path/to/test.pdf` 才會實際呼叫模型、生成影片並清除該次測試專案。
+
+`docs/CHANGE_RECORD.md`、`docs/UPDATE_LOG.md` 與舊部署 PDF／DOCX 保留作歷史紀錄，舊記錄的 API 不代表現行可用介面；部署以本 README 與 `deploy/README.md` 為準。本機檢查筆記、日誌、模型、環境檔與使用者專案資料不納入 Git。
 
 </details>
 
