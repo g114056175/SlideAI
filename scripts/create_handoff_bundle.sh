@@ -52,6 +52,8 @@ echo "[INFO] INCLUDE_VIDEO_RUNS=${INCLUDE_VIDEO_RUNS}"
 
 RSYNC_EXCLUDES=(
   "--exclude=.git"
+  "--exclude=runtime"
+  "--exclude=.pytest_cache"
   "--exclude=backend/.env"
   "--exclude=deploy/models.env"
   "--exclude=frontend/.env*.local"

@@ -154,8 +154,9 @@ def cmd_render_run(args: argparse.Namespace) -> None:
             print(f"[TTS] variant {variant_no}/{args.variants} page {idx + 1}/{len(pages)}")
             with ref_audio.open("rb") as fp:
                 tts_resp = session.post(
-                    api_url(args.api_base, "/api/video-abstract/tts-preview"),
+                    api_url(args.api_base, f"/api/video-runs/{args.run_id}/pages/{idx}/tts"),
                     data={
+                        "response_mode": "json",
                         "text": script,
                         "voice": args.voice,
                         "speed": str(args.speed),
@@ -165,17 +166,17 @@ def cmd_render_run(args: argparse.Namespace) -> None:
                     timeout=args.timeout,
                 )
             _raise_for_response(tts_resp)
-            audio_bytes = tts_resp.content
+            variant_id = tts_resp.json()["variant_id"]
 
             print(f"[ALIGN] page {idx + 1}")
             align_resp = session.post(
-                api_url(args.api_base, "/api/video-abstract/subtitle-align"),
+                api_url(args.api_base, f"/api/video-runs/{args.run_id}/pages/{idx}/align"),
                 data={
                     "text": script,
+                    "variant_id": variant_id,
                     "split_min_chars": str(args.split_min),
                     "split_max_chars": str(args.split_max),
                 },
-                files={"audio_file": (f"page_{idx + 1}_tts.wav", audio_bytes, "audio/wav")},
                 timeout=args.timeout,
             )
             _raise_for_response(align_resp)
@@ -183,14 +184,6 @@ def cmd_render_run(args: argparse.Namespace) -> None:
             segments = aligned.get("segments") or []
             if not segments:
                 raise RuntimeError(f"page {idx + 1}: empty alignment segments")
-
-            print(f"[THUMB] page {idx + 1}")
-            thumb_resp = session.get(
-                api_url(args.api_base, f"/api/video-runs/{args.run_id}/thumbnail?page={idx + 1}"),
-                timeout=args.timeout,
-            )
-            _raise_for_response(thumb_resp)
-            slide_bytes = thumb_resp.content
 
             print(f"[RENDER] page {idx + 1}")
             render_resp = session.post(
@@ -207,11 +200,8 @@ def cmd_render_run(args: argparse.Namespace) -> None:
                     "align_backend": str(aligned.get("backend") or ""),
                     "run_id": args.run_id,
                     "page_index": str(idx),
+                    "variant_id": variant_id,
                     "variant_label": f"cli-v{variant_no}-page-{idx + 1}",
-                },
-                files={
-                    "audio_file": (f"page_{idx + 1}_tts.wav", audio_bytes, "audio/wav"),
-                    "slide_image": (f"slide_{idx + 1}.png", slide_bytes, "image/png"),
                 },
                 timeout=args.timeout,
             )
@@ -249,39 +239,21 @@ def cmd_merge_run(args: argparse.Namespace) -> None:
     if not selected_pages:
         raise SystemExit("No selected/rendered page videos to merge")
 
-    session = requests.Session()
-    files = []
-    opened = []
-    try:
-        for idx, variant_id in selected_pages:
-            print(f"[FETCH] page {idx + 1} variant={variant_id}")
-            url = api_url(args.api_base, f"/api/video-runs/{args.run_id}/pages/{idx}/variants/{variant_id}/video")
-            resp = session.get(url, timeout=args.timeout)
-            _raise_for_response(resp)
-            files.append(("videos", (f"page_{idx + 1}.mp4", resp.content, "video/mp4")))
-
-        print(f"[MERGE] {len(files)} videos")
-        merge_resp = session.post(
-            api_url(args.api_base, "/api/video-abstract/merge-rendered-videos"),
-            files=files,
-            timeout=args.timeout,
+    with requests.Session() as session:
+        response = session.post(
+            api_url(args.api_base, f"/api/video-runs/{args.run_id}/exports/merge-selected"),
+            data={"page_indexes_json": json.dumps([idx for idx, _ in selected_pages]),
+                  "variant_ids_json": json.dumps(dict(selected_pages)), "response_mode": "video"},
+            timeout=args.timeout, stream=True,
         )
-        _raise_for_response(merge_resp)
+        _raise_for_response(response)
         out = Path(args.output).expanduser().resolve()
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_bytes(merge_resp.content)
-        print(json.dumps({
-            "run_id": args.run_id,
-            "output": str(out),
-            "pages": len(files),
-            "bytes": len(merge_resp.content),
-        }, ensure_ascii=False, indent=2))
-    finally:
-        for fp in opened:
-            try:
-                fp.close()
-            except Exception:
-                pass
+        with out.open("wb") as handle:
+            for chunk in response.iter_content(1024 * 1024):
+                handle.write(chunk)
+        response.close()
+        print(f"[OK] saved {out}")
 
 
 def main() -> int:

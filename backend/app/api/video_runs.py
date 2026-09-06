@@ -1,3 +1,4 @@
+from backend.app.services.upload_limits import read_upload_limited
 import os
 import logging
 import json
@@ -8,16 +9,13 @@ import zipfile
 from datetime import datetime
 from typing import Optional, List
 import re
-import uuid
 from urllib.parse import quote
 
 import pypdf as PyPDF2
 from fastapi import APIRouter, UploadFile, File, Form, Request, Query, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.background import BackgroundTask
-from pdf2image import convert_from_path
 from pydantic import BaseModel, Field
-from PIL import Image
 
 from backend.app.api.video_helpers import is_truthy_env
 from backend.app.services.artifact_store import get_video_run_store
@@ -83,7 +81,13 @@ async def _media_duration_seconds(path: str) -> float:
         "-of", "default=noprint_wrappers=1:nokey=1", path,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
-    stdout, _stderr = await proc.communicate()
+    try:
+        stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        if proc.returncode is None:
+            proc.kill()
+        await proc.communicate()
+        raise
     try:
         return max(0.0, float((stdout or b"").decode().strip()))
     except (TypeError, ValueError):
@@ -171,25 +175,6 @@ def _looks_incomplete(text: str) -> bool:
     return False
 
 
-def _parse_tagged_pages(raw: str, requested: list[int]) -> dict[int, str]:
-    out: dict[int, str] = {}
-    src = str(raw or "")
-    for page_idx in requested:
-        page_no = page_idx + 1
-        pattern = re.compile(
-            rf"(?:^|\n)\s*#?\s*PAGE[_\-\s]*0*{page_no}\s*#?\s*\n?"
-            rf"(.*?)"
-            rf"(?=(?:^|\n)\s*#?\s*(?:END[_\-\s]*PAGE|ENDPAGE)[_\-\s]*0*{page_no}\s*#?|"
-            rf"(?:^|\n)\s*#?\s*PAGE[_\-\s]*0*{page_no + 1}\s*#?|\Z)",
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        match = pattern.search(src)
-        if not match:
-            continue
-        body = match.group(1).strip()
-        if body:
-            out[page_idx] = _strip_any_page_tags(body)
-    return out
 
 
 def _strip_any_page_tags(raw: str) -> str:
@@ -199,55 +184,6 @@ def _strip_any_page_tags(raw: str) -> str:
     return s.strip()
 
 
-def _split_bulk_script_to_pages(raw: str, requested: list[int]) -> dict[int, str]:
-    """
-    Best-effort parser when strict #PAGE_NNN# tags are missing.
-    Supports:
-    - 第1頁 / 第 1 頁 / Page 1 / Slide 1 markers
-    - paragraph fallback (blank-line split)
-    """
-    src = str(raw or "").replace("\r\n", "\n").replace("\r", "\n")
-    out: dict[int, str] = {}
-    if not src.strip() or not requested:
-        return out
-
-    marker_pat = re.compile(
-        r"(?:^|\n)\s*(?:第\s*(\d+)\s*頁|page\s*(\d+)|slide\s*(\d+))\s*[:：\-]?\s*",
-        flags=re.IGNORECASE,
-    )
-    matches = list(marker_pat.finditer(src))
-    if matches:
-        for i, m in enumerate(matches):
-            page_no = int((m.group(1) or m.group(2) or m.group(3) or "0").strip() or "0")
-            if page_no <= 0:
-                continue
-            page_idx = page_no - 1
-            start = m.end()
-            end = matches[i + 1].start() if i + 1 < len(matches) else len(src)
-            body = _normalize_script_text(src[start:end])
-            if page_idx in requested and body:
-                out[page_idx] = body
-        if out:
-            return out
-
-    chunks = [x.strip() for x in re.split(r"\n\s*\n+", src) if x.strip()]
-    if not chunks:
-        one = _normalize_script_text(src)
-        if one:
-            out[requested[0]] = one
-        return out
-
-    if len(chunks) >= len(requested):
-        for i, page_idx in enumerate(requested):
-            if i < len(chunks):
-                out[page_idx] = _normalize_script_text(chunks[i])
-        return out
-
-    one = _normalize_script_text(src)
-    if one:
-        for page_idx in requested:
-            out[page_idx] = one
-    return out
 
 
 @router.get("/api/video-runs")
@@ -271,85 +207,31 @@ async def video_run_pdf(run_id: str):
     return FileResponse(pdf_path, media_type="application/pdf", filename=filename)
 
 
+async def _page_image_response(run_id, page_index, kind, request=None):
+    from backend.app.services.page_images import ensure_page_images
+    try:
+        paths = await asyncio.to_thread(ensure_page_images, get_video_run_store(), run_id, page_index)
+        response = FileResponse(str(paths[kind]), media_type="image/jpeg",
+                                stat_result=paths[kind].stat(), headers={"Cache-Control": "no-cache"})
+        if request is not None:
+            tags = request.headers.get("if-none-match", "").split(",")
+            if any(tag.strip().removeprefix("W/") in {"*", response.headers["etag"]} for tag in tags):
+                return Response(status_code=304, headers={
+                    "ETag": response.headers["etag"], "Cache-Control": "no-cache",
+                })
+        return response
+    except (FileNotFoundError, IndexError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
 @router.get("/api/video-runs/{run_id}/thumbnail")
-async def video_run_thumbnail(
-    run_id: str,
-    page: int = Query(1, ge=1),
-):
-    """Render/cache one page image from a persistent run PDF."""
-    try:
-        manifest = get_video_run_store().load_manifest(run_id)
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Run not found")
-
-    pdf_path = ((manifest.get("paths") or {}).get("pdf") or "").strip()
-    if not pdf_path or not os.path.isfile(pdf_path):
-        raise HTTPException(status_code=404, detail="Run PDF not found")
-
-    pages_dir = get_video_run_store().run_dir(run_id) / "pages"
-    page_dir = pages_dir / f"page_{page:03d}"
-    cache_path = page_dir / f"page_{page:03d}.jpg"
-    if cache_path.is_file():
-        return FileResponse(str(cache_path), media_type="image/jpeg")
-    legacy_cache_path = pages_dir / f"page_{page:03d}.jpg"
-    if legacy_cache_path.is_file():
-        return FileResponse(str(legacy_cache_path), media_type="image/jpeg")
-
-    try:
-        images = convert_from_path(
-            pdf_path,
-            first_page=page,
-            last_page=page,
-            thread_count=1,
-            poppler_path=os.getenv("POPPLER_PATH", None),
-        )
-        if not images:
-            raise HTTPException(status_code=500, detail="Failed to render PDF page")
-        page_dir.mkdir(parents=True, exist_ok=True)
-        img = images[0].convert("RGB")
-        max_w = 1280
-        if img.width > max_w:
-            ratio = max_w / max(img.width, 1)
-            img = img.resize((max_w, max(1, int(img.height * ratio))), Image.Resampling.LANCZOS)
-        img.save(cache_path, format="JPEG", quality=82, optimize=True)
-        return FileResponse(str(cache_path), media_type="image/jpeg")
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.error(f"[VideoRun] thumbnail failed: {exc}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Run thumbnail failed: {exc}")
+async def video_run_thumbnail(run_id: str, page: int = Query(1, ge=1), request: Request = None):
+    return await _page_image_response(run_id, page - 1, "thumbnail", request)
 
 
 @router.get("/api/video-runs/{run_id}/pages/{page_index}/image")
-async def get_video_run_page_image(run_id: str, page_index: int):
-    """Return the persisted page image without rendering the PDF again."""
-    try:
-        manifest = get_video_run_store().load_manifest(run_id)
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Run not found")
-
-    pages = manifest.get("pages") or []
-    if page_index < 0 or page_index >= len(pages):
-        raise HTTPException(status_code=404, detail="Page not found")
-
-    page = pages[page_index] or {}
-    candidates = []
-    slide_path = ((page.get("paths") or {}).get("slide") or "").strip()
-    if slide_path:
-        candidates.append(slide_path)
-    pdir = get_video_run_store().page_dir(run_id, page_index)
-    candidates.extend([
-        str(pdir / f"page_{page_index + 1:03d}.jpg"),
-        str(pdir / f"page_{page_index + 1:03d}.png"),
-        str(get_video_run_store().run_dir(run_id) / "pages" / f"page_{page_index + 1:03d}.jpg"),
-    ])
-
-    for candidate in candidates:
-        if candidate and os.path.isfile(candidate):
-            ext = os.path.splitext(candidate)[1].lower()
-            media_type = "image/png" if ext == ".png" else "image/jpeg"
-            return FileResponse(candidate, media_type=media_type)
-    raise HTTPException(status_code=404, detail="Page image not found")
+async def get_video_run_page_image(run_id: str, page_index: int, request: Request = None):
+    return await _page_image_response(run_id, page_index, "slide", request)
 
 
 @router.get("/api/video-runs/{run_id}")
@@ -385,7 +267,7 @@ async def update_video_run_scripts(run_id: str, req: VideoRunScriptsUpdateReques
 
 @router.post("/api/video-runs/{run_id}/scripts/generate")
 async def generate_video_run_scripts(run_id: str, req: VideoRunGenerateScriptsRequest):
-    """Generate scripts from run PDF text; for single-page generation, select by page index."""
+    """Generate scripts from individual PDF page images, including scanned PDFs."""
     try:
         manifest = get_video_run_store().load_manifest(run_id)
     except FileNotFoundError:
@@ -413,184 +295,37 @@ async def generate_video_run_scripts(run_id: str, req: VideoRunGenerateScriptsRe
 
     try:
         from backend.app.services.utility.api import (
-            generate_presentation_scripts,
-            generate_presentation_scripts_from_pdf_file,
-            get_configured_llm_provider,
-            get_llm_model_name,
+            generate_presentation_scripts_from_images, get_configured_llm_provider,
         )
-        provider = get_configured_llm_provider(api_key)
-        model_name = get_llm_model_name(provider)
-        logger.info(
-            "[VideoRun] scripts.generate run=%s scope=%s pages=%s provider=%s model=%s key_prefix=%s",
-            run_id,
-            scope,
-            requested,
-            provider,
-            model_name,
-            (api_key[:8] + "***") if api_key else "",
+        from backend.app.services.page_images import ensure_page_images
+        store = get_video_run_store()
+        image_paths = []
+        for index in requested:
+            paths = await asyncio.to_thread(ensure_page_images, store, run_id, index)
+            image_paths.append(str(paths["slide"]))
+        generated = await generate_presentation_scripts_from_images(
+            image_paths=image_paths, api_key=api_key, language=req.language,
         )
-
-        gen_requested: list[int] = []
-        generated_map: dict[int, str] = {}
-
-        # Gemini accepts the original PDF directly. Other built-in and custom
-        # OpenAI-compatible providers use the PDF text extraction path so a
-        # local endpoint does not need multimodal/PDF support.
-        if provider != "google":
-            from backend.app.services.utility.pdf import pdf_to_text_array
-
-            page_texts = list(await asyncio.to_thread(pdf_to_text_array, pdf_path) or [])
-            selected_texts = [page_texts[idx] if idx < len(page_texts) else "" for idx in requested]
-            generated = await generate_presentation_scripts(
-                text_array=selected_texts,
-                api_key=api_key,
-                language=req.language,
-            )
-            for result_idx, page_idx in enumerate(requested):
-                body = generated[result_idx] if result_idx < len(generated or []) else ""
-                normalized = _trim_redundant_opening(page_idx, _normalize_script_text(body))
-                if normalized:
-                    generated_map[page_idx] = normalized
-            gen_requested = [idx for idx in requested if generated_map.get(idx)]
-
-            scripts = [str(p.get("script") or "") for p in pages]
-            while len(scripts) < page_count:
-                scripts.append("")
-            if scope == "all":
-                for page_idx in requested:
-                    scripts[page_idx] = ""
-            for page_idx in gen_requested:
-                scripts[page_idx] = generated_map[page_idx]
-            updated_manifest = get_video_run_store().update_page_scripts(run_id, scripts)
-            return JSONResponse({
-                "run": updated_manifest,
-                "scripts": scripts,
-                "updated_pages": gen_requested,
-                "skipped_empty_pages": [idx for idx in requested if idx not in set(gen_requested)],
-                "text_stats": {
-                    "requested_pages": len(requested),
-                    "non_empty_pages": len(gen_requested),
-                },
-                "source": "pdf-text-extraction",
-                "provider": provider,
-                "scope": scope,
-            })
-
-        if scope == "all":
-            lang = str(req.language or "zh").lower()
-            if lang.startswith("en"):
-                script_prompt = (
-                    "Rewrite the whole deck into per-page spoken scripts in one output. "
-                    "STRICT FORMAT REQUIRED: for page N, output exactly:\n"
-                    "#PAGE_NNN#\n"
-                    "<one complete paragraph>\n"
-                    "#END_PAGE_NNN#\n"
-                    "where NNN is 3-digit page number (001, 002...). "
-                    "Never skip any requested page tag. "
-                    "Page 1 can have one short opening. Page 2+ must continue without repeated greetings. "
-                    "Adjust script length by slide information density instead of forcing equal length. "
-                    "Title, outline, section divider, or transition slides should stay concise. "
-                    "Slides with methods, diagrams, experimental results, comparison data, or multiple key points should be more complete: explain trends, differences, implications, and why the viewer should care, rather than merely reading slide text. "
-                    "The overall output should be fuller than a short summary and suitable for direct voice-over recording. "
-                    "Keep proper nouns, paper titles, author names, technical terms in original form. "
-                    "Each page must end with a complete sentence."
-                )
-            else:
-                script_prompt = (
-                    "請將整份簡報一次改寫成逐頁口語講稿。"
-                    "必須嚴格使用以下標記格式輸出每頁：\n"
-                    "#PAGE_NNN#\n"
-                    "<單一完整段落>\n"
-                    "#END_PAGE_NNN#\n"
-                    "其中 NNN 為三位數頁碼（001、002...）。不得漏頁、不得改標記字串。"
-                    "第1頁可簡短開場，第2頁起禁止重複開場白。"
-                    "請依每頁資訊密度分配講稿長度，不要讓每頁長度完全一致。"
-                    "若該頁是目錄、章節切換、單純標題或過渡頁，請簡短帶過。"
-                    "若該頁包含方法流程、圖表、比較數據、實驗結果或多個重點，請提供更完整的口語說明，說明圖表/數據代表的趨勢、差異與意義，而不是只覆述投影片文字。"
-                    "整體講稿應比簡短摘要更完整，適合直接用於語音簡報錄製。"
-                    "專有名詞、人名、論文標題、技術術語請保留原文，不要硬翻。"
-                    "每頁必須是完整句結尾，不可用冒號或未完成列點作結。"
-                )
-            # Force per-click variation to avoid near-identical outputs across repeated "fill all".
-            script_prompt += f"\n本次生成識別碼（僅作去重，不可輸出於最終內容）：{uuid.uuid4().hex[:12]}"
-            generated_all_text = await generate_presentation_scripts_from_pdf_file(
-                pdf_path=pdf_path,
-                prompt=script_prompt,
-                api_key=api_key,
-                model_name_override=model_name,
-                temperature=0.9,
-            )
-            parsed = _parse_tagged_pages(str(generated_all_text or ""), requested)
-            if not parsed:
-                parsed = _split_bulk_script_to_pages(str(generated_all_text or ""), requested)
-            for page_idx, body in parsed.items():
-                generated_map[page_idx] = _trim_redundant_opening(page_idx, _normalize_script_text(body))
-            gen_requested = [idx for idx in requested if generated_map.get(idx)]
-        else:
-            page_idx = requested[0]
-            page_no = page_idx + 1
-            lang = str(req.language or "zh").lower()
-            if lang.startswith("en"):
-                prompt = (
-                    "Generate spoken script for exactly one slide from this PDF. "
-                    f"Only output page {page_no} in this exact format:\n"
-                    f"#PAGE_{page_no:03d}#\n"
-                    "<one complete paragraph>\n"
-                    f"#END_PAGE_{page_no:03d}#\n"
-                    "Adjust length by this slide's information density. "
-                    "If it is a title, outline, section divider, or transition slide, keep it concise. "
-                    "If it contains methods, diagrams, experimental results, comparison data, or multiple key points, give a more complete spoken explanation including trends, differences, implications, and why they matter. "
-                    "Keep proper nouns and technical terms in original form. End with a complete sentence."
-                )
-            else:
-                prompt = (
-                    "請根據這份 PDF，只輸出指定單頁講稿。"
-                    f"只可輸出第 {page_no} 頁，格式必須完全一致：\n"
-                    f"#PAGE_{page_no:03d}#\n"
-                    "<單一完整段落>\n"
-                    f"#END_PAGE_{page_no:03d}#\n"
-                    "請依此頁資訊密度決定講稿長度。若是標題、目錄、章節切換或過渡頁，請簡短帶過。"
-                    "若包含方法流程、圖表、比較數據、實驗結果或多個重點，請提供較完整的口語說明，說明趨勢、差異與意義，不要只覆述投影片文字。"
-                    "專有名詞、人名、術語請保留原文。"
-                )
-            one_text = await generate_presentation_scripts_from_pdf_file(
-                pdf_path=pdf_path,
-                prompt=prompt,
-                api_key=api_key,
-                model_name_override=model_name,
-                temperature=0.75,
-            )
-            parsed_one = _parse_tagged_pages(str(one_text or ""), [page_idx])
-            candidate_raw = parsed_one.get(page_idx, "")
-            candidate = _trim_redundant_opening(page_idx, _normalize_script_text(candidate_raw))
-            if candidate:
-                generated_map[page_idx] = candidate
-                gen_requested = [page_idx]
-
-        scripts = [str(p.get("script") or "") for p in pages]
-        while len(scripts) < page_count:
-            scripts.append("")
-        # Avoid stale old content on "fill all": requested pages are always rewritten
-        # by this call. If a page is still missing after retries, keep it empty instead
-        # of silently preserving old script.
-        if scope == "all":
-            for page_idx in requested:
-                scripts[page_idx] = ""
-        for page_idx in gen_requested:
-            scripts[page_idx] = generated_map.get(page_idx, "")
-        manifest = get_video_run_store().update_page_scripts(run_id, scripts)
-
+        generated_map = {
+            index: _trim_redundant_opening(index, _normalize_script_text(text))
+            for index, text in zip(requested, generated)
+        }
+        if len(generated) != len(requested) or any(not text for text in generated_map.values()):
+            raise ValueError("模型未回傳完整講稿；原講稿已保留。")
+        store = get_video_run_store()
+        # Preserve edits to other pages made while the model request was running.
+        latest = store.load_manifest(run_id)
+        scripts = [str(page.get("script") or "") for page in latest.get("pages") or []]
+        for index in requested:
+            if scripts[index] != str(pages[index].get("script") or ""):
+                raise HTTPException(status_code=409, detail="生成期間講稿已被修改，請重新生成以避免覆蓋。")
+            scripts[index] = generated_map[index]
+        updated = store.update_page_scripts(run_id, scripts)
         return JSONResponse({
-            "run": manifest,
-            "scripts": scripts,
-            "updated_pages": gen_requested,
-            "skipped_empty_pages": [idx for idx in requested if idx not in set(gen_requested)],
-            "text_stats": {
-                "requested_pages": len(requested),
-                "non_empty_pages": len(gen_requested),
-            },
-            "source": "pdf-direct-file",
-            "scope": scope,
+            "run": updated, "scripts": scripts, "updated_pages": requested,
+            "skipped_empty_pages": [],
+            "text_stats": {"requested_pages": len(requested), "non_empty_pages": len(requested)},
+            "source": "slide-image", "provider": get_configured_llm_provider(api_key), "scope": scope,
         })
     except HTTPException:
         raise
@@ -614,7 +349,7 @@ async def update_video_run_settings(
             raise ValueError("settings_json must be valid JSON")
         if not isinstance(settings, dict):
             raise ValueError("settings_json must be a JSON object")
-        audio_bytes = await reference_audio.read() if reference_audio is not None else None
+        audio_bytes = await read_upload_limited(reference_audio) if reference_audio is not None else None
         audio_name = reference_audio.filename if reference_audio is not None else "reference.wav"
         return JSONResponse(get_video_run_store().update_settings(
             run_id,
@@ -718,7 +453,7 @@ async def get_video_run_variant_bundle(run_id: str, page_index: int, variant_id:
             entries.append((srt_path, f"page_{page_index + 1}.srt"))
         except FileNotFoundError:
             pass
-        return _download_bundle(entries, f"{run_id}_page_{page_index + 1}_{variant_id}.zip")
+        return await asyncio.to_thread(_download_bundle, entries, f"{run_id}_page_{page_index + 1}_{variant_id}.zip")
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Variant video not found")
     except IndexError:
@@ -911,7 +646,8 @@ async def merge_selected_video_run_variants(
                     merged_segments.append(item)
             except Exception as exc:
                 logger.warning("Cannot include page SRT in merged export: %s", exc)
-        offset += await _media_duration_seconds(video_path)
+        durations = transition_metadata.get("input_durations") or []
+        offset += float(durations[position]) if position < len(durations) else await _media_duration_seconds(video_path)
         if uses_inserted_transitions and position < len(input_paths) - 1:
             offset += inserted_duration
     merged_srt = build_srt(merged_segments) if merged_segments else ""
@@ -998,7 +734,7 @@ async def get_video_run_export_bundle(run_id: str, variant_id: str):
             entries.append((srt_path, f"{base_name}.srt"))
         except FileNotFoundError:
             pass
-        return _download_bundle(entries, f"{base_name}.zip")
+        return await asyncio.to_thread(_download_bundle, entries, f"{base_name}.zip")
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Export video not found")
 

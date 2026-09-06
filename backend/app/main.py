@@ -42,11 +42,11 @@ def check_poppler_available() -> None:
 
 
 def recover_video_batch_queue() -> None:
-    """Resume durable FIFO jobs after a backend restart."""
+    """Mark orphaned jobs as interrupted, awaiting the user's recovery decision."""
     recovered = video.recover_persistent_batch_jobs()
     if recovered:
         logging.getLogger("slideai.batch").info(
-            "Recovered %s queued/interrupted batch render job(s)", recovered
+            "Marked %s orphaned batch render job(s) for recovery or cancellation", recovered
         )
 
 

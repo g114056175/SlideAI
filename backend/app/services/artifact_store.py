@@ -187,24 +187,6 @@ class VideoRunStore:
                 break
         return out
 
-    def find_manifest_by_pdf_id(self, pdf_id: str) -> Optional[Dict[str, Any]]:
-        """Return the newest persistent run that owns a legacy PDF id."""
-        wanted = str(pdf_id or "").strip()
-        if not wanted:
-            return None
-        manifests = sorted(
-            self.root.glob("*/manifest.json"),
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        )
-        for path in manifests:
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            if str(data.get("pdf_id") or "").strip() == wanted:
-                return data
-        return None
 
     @_locked_run_mutation
     def delete_run(self, run_id: str) -> None:
@@ -291,6 +273,29 @@ class VideoRunStore:
 
     def page_dir(self, run_id: str, page_index: int) -> Path:
         return self.run_dir(run_id) / "pages" / f"page_{page_index + 1:03d}"
+
+    @_locked_run_mutation
+    def record_page_images(self, *, run_id, page_index, large, small, version):
+        manifest = self.load_manifest(run_id)
+        page = manifest["pages"][page_index]
+        pdir = self.page_dir(run_id, page_index)
+        pdir.mkdir(parents=True, exist_ok=True)
+        for key, name, content in (
+            ("slide", f"page_{page_index + 1:03d}.jpg", large),
+            ("thumbnail", "thumbnail.jpg", small),
+        ):
+            target = pdir / name
+            with tempfile.NamedTemporaryFile(dir=pdir, delete=False) as handle:
+                temporary = Path(handle.name)
+                handle.write(content)
+            try:
+                os.replace(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
+            page.setdefault("paths", {})[key] = str(target)
+        page["image_version"] = version
+        self.save_manifest(manifest)
+        return page
 
     @_locked_run_mutation
     def record_page_asset(
@@ -820,7 +825,29 @@ class VideoRunStore:
         if not self.manifest_path(run_id).is_file():
             raise FileNotFoundError(f"run not found: {run_id}")
         job_id = f"job-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+        manifest = self.load_manifest(run_id)
+        current = (manifest.get("settings") or {}).get("current") or {}
+        payload = dict(payload)
+        payload["selected_voice_key"] = payload.get("selected_voice_key") or current.get("selected_voice_key") or ""
+        payload["reference_text"] = payload.get("reference_text") or current.get("reference_text") or ""
+        # Job-owned inputs survive edits to the project while a job is queued
+        # or interrupted. Never recover using a mixture of old audio/new text.
+        snapshot = {"scripts": [str(page.get("script") or "") for page in manifest.get("pages") or []]}
+        reference = current.get("reference_audio") or {}
+        source = Path(str(reference.get("path") or ""))
+        if not source.is_file():
+            voices_dir = Path(__file__).resolve().parents[1] / "static" / "ref_voices"
+            voices = json.loads((voices_dir / "manifest.json").read_text(encoding="utf-8"))
+            voice = voices.get(payload["selected_voice_key"]) or {}
+            source = voices_dir / Path(str(voice.get("file") or "")).name
+            payload["reference_text"] = payload["reference_text"] or voice.get("transcript") or ""
+        if source.is_file():
+            target = self.run_dir(run_id) / "jobs" / job_id / ("reference" + source.suffix)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            snapshot["reference_audio"] = str(target)
         job = {
+            "input_snapshot": snapshot,
             "job_id": job_id,
             "run_id": run_id,
             "status": "queued",

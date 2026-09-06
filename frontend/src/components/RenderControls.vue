@@ -18,12 +18,12 @@
       >
         終止: 第{{ pageIdx + 1 }}頁
       </button>
-      <div class="merge-action">
+      <div ref="mergeRoot" class="merge-action">
         <button
           class="btn merge-btn"
           :disabled="!renderedCount"
           :aria-expanded="showMergeOptions"
-          @click="showMergeOptions = !showMergeOptions"
+          @click="toggleMerge"
         >合併匯出 <span class="merge-caret">▾</span></button>
         <div v-if="showMergeOptions" class="merge-options" role="menu">
           <button type="button" role="menuitem" @click="chooseMerge(false)">
@@ -48,7 +48,8 @@
 </template>
 
 <script setup>
-import { computed, ref } from 'vue'
+import { computed, watch } from 'vue'
+import { useExclusiveMenu } from '../composables/useExclusiveMenu.js'
 import DownloadMenu from './DownloadMenu.vue'
 
 const props = defineProps({
@@ -69,10 +70,11 @@ const props = defineProps({
 const emit = defineEmits(['render-current', 'render-all', 'stop-all', 'stop-page', 'merge'])
 
 const showStopAll = computed(() => props.rendering || props.renderingAll || props.queueLength > 0)
-const showMergeOptions = ref(false)
+const { root: mergeRoot, open: showMergeOptions, toggle: toggleMerge, close: closeMerge } = useExclusiveMenu()
+watch(() => [props.renderedCount, props.downloadVideoUrl], closeMerge)
 
 const chooseMerge = (transitionsEnabled) => {
-  showMergeOptions.value = false
+  closeMerge()
   emit('merge', !!transitionsEnabled)
 }
 </script>
@@ -163,13 +165,13 @@ const chooseMerge = (transitionsEnabled) => {
   border-radius: 7px;
   color: #e2e8f0;
   background: transparent;
+  font-size: 13px;
+  font-weight: 500;
   text-align: left;
 }
 
 .merge-options button:hover {
   background: #172033;
-  font-size: 13px;
-  font-weight: 700;
 }
 
 .preview-actions-row > .btn-success {

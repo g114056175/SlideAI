@@ -47,6 +47,7 @@ build/
 
 # Test
 coverage/
+.pytest_cache/
 
 # Others
 *.suo
@@ -68,7 +69,6 @@ coverage/
 temp/
 temp_*/
 tmp_pdf/
-backend/tmp_pdf/frontend/.env.development.local
 frontend/.env*.local
 
 # SlideAI local persistent run artifacts

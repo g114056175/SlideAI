@@ -45,7 +45,13 @@ async def _run(command: list[str]) -> tuple[int, bytes, bytes]:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=1800)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        if proc.returncode is None:
+            proc.kill()
+        await proc.communicate()
+        raise
     return proc.returncode or 0, stdout or b"", stderr or b""
 
 
@@ -204,6 +210,7 @@ async def _merge_with_inserted_transitions(
         "duration_seconds": round(duration, 3),
         "inserted_duration_seconds": round(duration * len(effects), 3),
         "output_size": [target_width, target_height],
+        "input_durations": [item["duration"] for item in media],
     }
 
 
@@ -287,6 +294,7 @@ async def _merge_with_transitions(
         "effects": effects,
         "duration_seconds": round(transition_seconds, 3),
         "output_size": [target_width, target_height],
+        "input_durations": [item["duration"] for item in media],
     }
 
 

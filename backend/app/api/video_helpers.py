@@ -4,8 +4,6 @@ import shutil
 import subprocess
 import tempfile
 import time
-import hashlib
-from pdf2image import convert_from_path
 
 _OPENCC_S2T = None
 _OPENCC_S2T_IMPORT_FAILED = False
@@ -15,13 +13,6 @@ def is_truthy_env(name: str, default: str = "false") -> bool:
     raw = os.getenv(name, default)
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
-
-def make_alignment_id(audio_bytes: bytes, text: str, backend: str) -> str:
-    h = hashlib.sha1()
-    h.update(audio_bytes or b"")
-    h.update((text or "").encode("utf-8", errors="ignore"))
-    h.update((backend or "").encode("utf-8", errors="ignore"))
-    return h.hexdigest()[:24]
 
 
 def to_traditional_chinese_for_display(text: str) -> str:
@@ -144,25 +135,6 @@ def apply_audio_speed(src_path: str, speed: float) -> str:
         msg = (proc.stderr or proc.stdout or "ffmpeg speed adjust failed").strip()
         raise RuntimeError(f"音檔調速失敗: {msg[:400]}")
     return out_path
-
-
-def pregenerate_thumbnails_safe(pdf_path: str, thumb_dir: str, logger) -> None:
-    """Best-effort thumbnail generation in background; never raises."""
-    try:
-        os.makedirs(thumb_dir, exist_ok=True)
-        all_pages = convert_from_path(
-            pdf_path,
-            thread_count=2,
-            poppler_path=os.getenv("POPPLER_PATH", None),
-        )
-        for page_num, img in enumerate(all_pages, start=1):
-            final_path = os.path.join(thumb_dir, f"page_{page_num}.png")
-            tmp_path = f"{final_path}.tmp"
-            img.save(tmp_path, format="PNG")
-            os.replace(tmp_path, final_path)
-        logger.info(f"[UPLOAD][BG] Saved {len(all_pages)} thumbnails to {thumb_dir}")
-    except Exception as thumb_err:
-        logger.warning(f"[UPLOAD][BG] Thumbnail pre-generation failed: {thumb_err}")
 
 
 def is_mock_mode() -> bool:

@@ -66,6 +66,41 @@ When asking an agent to implement or merge changes, include:
 
 ## Change Entries
 
+### [CR-20260906-001] Canonical project workflow, recovery and shared page images
+- Date: 2026-09-06
+- Author: Codex (implementation and verification)
+- Type: fix
+- Scope: cross-module
+- Related Issue/PR: N/A
+
+#### Why
+- Legacy endpoints and UI fallbacks bypassed persistent projects; previews repeated work and interrupted jobs lacked reliable input snapshots.
+- ASS rendering could fail with an undefined helper; adjacent menus could overlap and change text appearance on hover.
+
+#### What Changed
+- Files: backend/app/api/video.py, video_runs.py; services/artifact_store.py, page_images.py, utility/api.py; frontend/src/components and composables; backend/scripts/video_run_cli.py; scripts/smoke_test.sh; README.md.
+- Behavior: require run/page/variant IDs for rendering, reuse saved assets, remove unused account/admin UI and text-only LLM helpers, generate scripts independently from upload, retain model-free startup.
+- Save job inputs for opt-in interrupted recovery. Share one 1080p-bounded JPEG and one thumbnail per page; prioritize initial preview then preload other pages.
+- Restore ASS helper import, validate uploads, bound FFmpeg execution, update main-environment dependencies, and make dropdowns mutually exclusive with stable hover text.
+- Preserve the existing reverse-proxy router base adjustment. Keep local audit notes and runtime output out of source handoff bundles and Git.
+
+#### API/Contract Impact
+- Endpoint/Interface: remove legacy thumbnail, standalone alignment/render and uploaded-media merge endpoints; CLI and smoke script use persistent run assets.
+- Backward Compatibility: breaking for old clients without run_id; current WebUI, CLI and backend must be deployed together.
+
+#### Risks
+- Full GPU/LLM generation and a fresh Docker deployment were not rerun for this release. External model runtimes require separate dependency and compatibility checks.
+- Older interrupted jobs without input snapshots require a new job. Image migration updates cached images in place; it retains source PDFs and generated media.
+
+#### Verification
+- Backend: 59 tests and 11 subtests passed, including real FFmpeg render/persistence in burn, sidecar and none modes.
+- Frontend: 17 Node tests, one Chromium menu/mount test, and production build passed.
+- Basic live smoke test and shell syntax checks passed. Full model smoke test was updated but not executed.
+
+#### Rollback
+- Original branches remain unchanged; switch to the preceding commit (7c8145f) to restore source. Back up data/video_runs separately before experimenting with older code; Git does not version user artifacts.
+
+
 ### [CR-20260417-001] Frontend Dev API Default Port Alignment (8000 -> 8001)
 - Date: 2026-04-17
 - Author: Codex Agent
